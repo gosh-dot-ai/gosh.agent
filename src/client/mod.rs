@@ -1,0 +1,97 @@
+// Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
+// License: MIT
+
+pub mod memory;
+pub mod transport;
+
+use anyhow::bail;
+use anyhow::Result;
+use serde_json::json;
+use serde_json::Value;
+pub use transport::McpTransport;
+
+/// MCP client.
+pub struct McpClient {
+    transport: Box<dyn McpTransport>,
+    client_name: String,
+}
+
+impl McpClient {
+    pub fn new(transport: impl McpTransport + 'static, client_name: &str) -> Self {
+        Self { transport: Box::new(transport), client_name: client_name.to_string() }
+    }
+
+    #[allow(dead_code)]
+    pub fn transport(&self) -> &dyn McpTransport {
+        &*self.transport
+    }
+
+    pub async fn initialize(&self) -> Result<String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": &self.client_name, "version": "0.1.0" }
+            }
+        });
+
+        let (resp, sid) = self.transport.send(&body, None).await?;
+        let session_id =
+            sid.ok_or_else(|| anyhow::anyhow!("server did not return Mcp-Session-Id"))?;
+
+        if let Some(error) = resp.get("error") {
+            bail!("MCP initialize error: {error}");
+        }
+
+        let notify = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let _ = self.transport.send(&notify, Some(&session_id)).await;
+
+        Ok(session_id)
+    }
+
+    pub async fn call_tool(&self, tool_name: &str, args: Value) -> Result<Value> {
+        let session_id = self.initialize().await?;
+
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": args }
+        });
+
+        let (result, _) = self.transport.send(&body, Some(&session_id)).await?;
+
+        if let Some(error) = result.get("error") {
+            bail!("MCP error: {error}");
+        }
+
+        let mcp_result = result.get("result");
+        let is_error =
+            mcp_result.and_then(|r| r.get("isError")).and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if let Some(content) = mcp_result.and_then(|r| r.get("content")).and_then(|c| c.as_array())
+        {
+            for item in content {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        if is_error {
+                            bail!("{tool_name}: {text}");
+                        }
+                        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                            return Ok(parsed);
+                        }
+                        return Ok(Value::String(text.to_string()));
+                    }
+                }
+            }
+        }
+
+        Ok(result.get("result").cloned().unwrap_or(Value::Null))
+    }
+}

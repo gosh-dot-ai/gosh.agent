@@ -1,11 +1,12 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 pub mod courier_subscribe;
 pub mod courier_unsubscribe;
 pub mod create_task;
 pub mod start;
 pub mod status;
+pub mod task_list;
 
 use std::sync::Arc;
 
@@ -60,6 +61,7 @@ pub async fn handle(
                 "agent_start" => start::handle(&state, &args).await,
                 "agent_status" => status::handle(&state, &args).await,
                 "agent_create_task" => create_task::handle(&state, &args).await,
+                "agent_task_list" => task_list::handle(&state, &args).await,
                 "agent_courier_subscribe" => courier_subscribe::handle(state.clone(), &args).await,
                 "agent_courier_unsubscribe" => courier_unsubscribe::handle(&state).await,
                 _ => json!({
@@ -68,7 +70,8 @@ pub async fn handle(
                 }),
             };
 
-            let is_error = result.get("error").is_some();
+            let is_error =
+                result.get("error").is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
             let resp = json!({
                 "jsonrpc": "2.0",
                 "id": id,

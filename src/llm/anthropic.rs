@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use anyhow::bail;
 use anyhow::Result;
@@ -22,6 +22,25 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
         Self { api_key, http: reqwest::Client::new() }
+    }
+}
+
+fn parse_usage(data: &Value) -> Usage {
+    let usage = data.get("usage").unwrap_or(&Value::Null);
+    Usage {
+        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        reasoning_tokens: 0,
+        cached_input_read_tokens: usage
+            .get("cache_read_input_tokens")
+            .or_else(|| usage.get("cache_read_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        cached_input_write_tokens: usage
+            .get("cache_creation_input_tokens")
+            .or_else(|| usage.get("cache_write_input_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
     }
 }
 
@@ -77,10 +96,7 @@ impl LlmProvider for AnthropicProvider {
 
         let data: Value = resp.json().await?;
 
-        let usage = Usage {
-            input_tokens: data["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32,
-            output_tokens: data["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32,
-        };
+        let usage = parse_usage(&data);
 
         let stop_reason = data["stop_reason"].as_str().unwrap_or("end_turn").to_string();
 
@@ -110,5 +126,57 @@ impl LlmProvider for AnthropicProvider {
         let text = if text_parts.is_empty() { None } else { Some(text_parts.join("\n")) };
 
         Ok(LlmResponse { text, tool_calls, usage, stop_reason })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::parse_usage;
+    use crate::llm::Usage;
+
+    #[test]
+    fn anthropic_usage_with_cache_fields_populates_cache_usage() {
+        let usage = parse_usage(&json!({
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 40,
+                "cache_read_input_tokens": 80,
+                "cache_creation_input_tokens": 20
+            }
+        }));
+
+        assert_eq!(
+            usage,
+            Usage {
+                input_tokens: 120,
+                output_tokens: 40,
+                reasoning_tokens: 0,
+                cached_input_read_tokens: 80,
+                cached_input_write_tokens: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn anthropic_missing_extra_fields_default_to_zero() {
+        let usage = parse_usage(&json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5
+            }
+        }));
+
+        assert_eq!(
+            usage,
+            Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+                cached_input_read_tokens: 0,
+                cached_input_write_tokens: 0,
+            }
+        );
     }
 }

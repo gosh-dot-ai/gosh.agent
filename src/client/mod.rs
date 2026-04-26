@@ -1,7 +1,8 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 pub mod memory;
+pub mod secrets;
 pub mod transport;
 
 use anyhow::bail;
@@ -84,6 +85,14 @@ impl McpClient {
                             bail!("{tool_name}: {text}");
                         }
                         if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                            // Check for application-level errors returned as JSON
+                            if let Some(err_msg) = parsed.get("error").and_then(|v| v.as_str()) {
+                                let code = parsed
+                                    .get("code")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("UNKNOWN");
+                                bail!("{tool_name} error: {err_msg} (code: {code})");
+                            }
                             return Ok(parsed);
                         }
                         return Ok(Value::String(text.to_string()));

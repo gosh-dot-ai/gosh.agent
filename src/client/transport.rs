@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use anyhow::bail;
 use anyhow::Result;
@@ -18,21 +18,37 @@ pub trait McpTransport: Send + Sync {
 pub struct HttpTransport {
     base_url: String,
     http: reqwest::Client,
-    token: Option<String>,
+    server_token: Option<String>,
+    principal_auth_token: Option<String>,
 }
 
 impl HttpTransport {
-    pub fn new(base_url: &str, token: Option<String>) -> Self {
+    pub fn new(
+        base_url: &str,
+        server_token: Option<String>,
+        principal_auth_token: Option<String>,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
-            token,
+            server_token,
+            principal_auth_token,
         }
     }
 
     /// Create transport with a custom reqwest Client (e.g. for TLS pinning).
-    pub fn with_client(base_url: &str, token: Option<String>, client: reqwest::Client) -> Self {
-        Self { base_url: base_url.trim_end_matches('/').to_string(), http: client, token }
+    pub fn with_client(
+        base_url: &str,
+        server_token: Option<String>,
+        principal_auth_token: Option<String>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            http: client,
+            server_token,
+            principal_auth_token,
+        }
     }
 }
 
@@ -51,8 +67,11 @@ impl McpTransport for HttpTransport {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
 
-        if let Some(token) = &self.token {
+        if let Some(token) = &self.server_token {
             req = req.header("x-server-token", token);
+        }
+        if let Some(token) = &self.principal_auth_token {
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         if let Some(sid) = session_id {
             req = req.header("Mcp-Session-Id", sid);

@@ -23,8 +23,10 @@ Or via gosh.cli: `gosh start` (starts memory first, then agent).
 If your deployment uses join tokens, prefer:
 
 ```bash
-./target/release/gosh-agent --join YOUR_JOIN_TOKEN
+./target/release/gosh-agent --join-file /path/to/agent.join
 ```
+
+Inline `--join` bearer bundles are intentionally not the default path because they leak credentials via shell history and process lists.
 
 ## Local Development
 

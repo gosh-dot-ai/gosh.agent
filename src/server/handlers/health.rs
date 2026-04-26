@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use axum::response::IntoResponse;
 use axum::Json;

@@ -1,7 +1,8 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 pub mod anthropic;
+pub mod local_cli;
 pub mod multi;
 
 use anyhow::Result;
@@ -34,10 +35,13 @@ pub struct ToolCall {
 }
 
 /// Token usage from a single LLM call.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub reasoning_tokens: u32,
+    pub cached_input_read_tokens: u32,
+    pub cached_input_write_tokens: u32,
 }
 
 /// Parsed response from an LLM call.

@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use std::sync::Arc;
 
@@ -146,84 +146,14 @@ fn target_contains(fact: &Value, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::Arc;
 
-    use async_trait::async_trait;
     use serde_json::json;
 
     use super::*;
     use crate::client::memory::MemoryMcpClient;
-    use crate::client::McpTransport;
-
-    /// Mock transport that records calls and returns pre-configured responses.
-    struct MockTransport {
-        responses: Mutex<Vec<Value>>,
-        calls: Mutex<Vec<(String, Value)>>,
-    }
-
-    impl MockTransport {
-        fn new(responses: Vec<Value>) -> Self {
-            Self { responses: Mutex::new(responses), calls: Mutex::new(Vec::new()) }
-        }
-    }
-
-    #[async_trait]
-    impl McpTransport for MockTransport {
-        async fn send(
-            &self,
-            body: &Value,
-            _session_id: Option<&str>,
-        ) -> anyhow::Result<(Value, Option<String>)> {
-            let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
-
-            if method == "initialize" {
-                return Ok((
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "result": {
-                            "protocolVersion": "2025-03-26",
-                            "capabilities": {},
-                            "serverInfo": { "name": "mock", "version": "0.1.0" }
-                        }
-                    }),
-                    Some("mock-session".to_string()),
-                ));
-            }
-
-            if method == "notifications/initialized" {
-                return Ok((json!({}), Some("mock-session".to_string())));
-            }
-
-            let tool_name =
-                body.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let args = body.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-            self.calls.lock().unwrap().push((tool_name, args));
-
-            let resp = {
-                let mut resps = self.responses.lock().unwrap();
-                if resps.is_empty() {
-                    json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"null"}]}})
-                } else {
-                    resps.remove(0)
-                }
-            };
-
-            Ok((resp, Some("mock-session".to_string())))
-        }
-    }
-
-    fn wrap_mcp_response(payload: &Value) -> Value {
-        let text = serde_json::to_string(payload).unwrap();
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "content": [{"type": "text", "text": text}],
-                "isError": false
-            }
-        })
-    }
+    use crate::test_support::wrap_mcp_response;
+    use crate::test_support::MockTransport;
 
     #[tokio::test]
     async fn resolver_exact_fact_id_works() {
@@ -235,7 +165,8 @@ mod tests {
             "metadata": {"task_id": "ext-001"}
         });
 
-        let transport = MockTransport::new(vec![wrap_mcp_response(&json!({ "fact": task_fact }))]);
+        let (transport, _mock_state) =
+            MockTransport::new(vec![wrap_mcp_response(&json!({ "fact": task_fact }))]);
         let memory = Arc::new(MemoryMcpClient::new(transport));
 
         let result = resolve_task(&memory, "fact-abc-123", "worker-1", "default", "default").await;
@@ -256,7 +187,8 @@ mod tests {
             "metadata": {"task_id": "wrapped-001"}
         });
 
-        let transport = MockTransport::new(vec![wrap_mcp_response(&json!({ "fact": task_fact }))]);
+        let (transport, _mock_state) =
+            MockTransport::new(vec![wrap_mcp_response(&json!({ "fact": task_fact }))]);
         let memory = Arc::new(MemoryMcpClient::new(transport));
 
         let result = resolve_task(&memory, "fact-wrap-1", "worker-1", "default", "default").await;
@@ -282,7 +214,7 @@ mod tests {
             }]
         }));
 
-        let transport = MockTransport::new(vec![get_resp, query_resp]);
+        let (transport, _mock_state) = MockTransport::new(vec![get_resp, query_resp]);
         let memory = Arc::new(MemoryMcpClient::new(transport));
 
         let result = resolve_task(&memory, "my-task", "worker-1", "default", "default").await;
@@ -302,7 +234,8 @@ mod tests {
             "metadata": {"task_id": "ext-001"}
         });
 
-        let transport = MockTransport::new(vec![wrap_mcp_response(&json!({ "fact": task_fact }))]);
+        let (transport, _mock_state) =
+            MockTransport::new(vec![wrap_mcp_response(&json!({ "fact": task_fact }))]);
         let memory = Arc::new(MemoryMcpClient::new(transport));
 
         let result = resolve_task(&memory, "fact-abc", "worker-1", "default", "default").await;
@@ -322,7 +255,7 @@ mod tests {
             ]
         }));
 
-        let transport = MockTransport::new(vec![get_resp, query_resp]);
+        let (transport, _mock_state) = MockTransport::new(vec![get_resp, query_resp]);
         let memory = Arc::new(MemoryMcpClient::new(transport));
 
         let result = resolve_task(&memory, "dup", "w", "default", "default").await;
@@ -337,7 +270,7 @@ mod tests {
         let get_resp = wrap_mcp_response(&json!(null));
         let query_resp = wrap_mcp_response(&json!({"facts": []}));
 
-        let transport = MockTransport::new(vec![get_resp, query_resp]);
+        let (transport, _mock_state) = MockTransport::new(vec![get_resp, query_resp]);
         let memory = Arc::new(MemoryMcpClient::new(transport));
 
         let result = resolve_task(&memory, "nonexistent", "w", "default", "default").await;

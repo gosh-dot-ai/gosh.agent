@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use std::sync::Arc;
 use std::time::Duration;

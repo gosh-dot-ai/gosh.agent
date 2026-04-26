@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -49,6 +49,10 @@ pub struct AppState {
     pub agent: Agent,
     pub memory: Arc<MemoryMcpClient>,
     pub courier: Mutex<CourierListener>,
+    /// Agent ID derived from principal_id (e.g., "agent:myagent" → "myagent").
+    /// Used as default agent_id for memory MCP calls.
+    pub agent_id: String,
+    pub default_context_key: Option<String>,
     pub session_counter: Mutex<u64>,
     pub dispatched_tasks: Mutex<DispatchedTracker>,
     pub in_flight_tasks: Mutex<HashSet<String>>,

@@ -1,16 +1,20 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use serde_json::json;
 use serde_json::Value;
 
-use crate::agent::config_loader;
 use crate::server::AppState;
 
 pub async fn handle(state: &AppState, args: &Value) -> Value {
-    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("default");
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(&state.agent_id);
     let swarm_id = args.get("swarm_id").and_then(|v| v.as_str()).unwrap_or("default");
-    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("default");
+    let work_key = args.get("key").and_then(|v| v.as_str()).unwrap_or("default");
+    let context_key = args
+        .get("context_key")
+        .and_then(|v| v.as_str())
+        .or(state.default_context_key.as_deref())
+        .unwrap_or(work_key);
     let task_ref = args.get("task_id").and_then(|v| v.as_str());
     let budget = args.get("budget_shell").and_then(|v| v.as_f64()).unwrap_or(10.0);
 
@@ -23,56 +27,49 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
         return json!({"error": "budget_shell must be >= 1.0", "code": "INVALID_BUDGET"});
     }
 
-    let effective_config = match config_loader::load_agent_config(
-        &state.memory,
-        &state.agent.config,
-        key,
-        agent_id,
-        swarm_id,
-    )
-    .await
-    {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return json!({
-                "task_id": task_ref,
-                "status": "failure",
-                "shell_spent": 0.0,
-                "artifacts_written": [],
-                "error": format!("CONFIG_LOAD_FAILED: {e}"),
-            });
-        }
-    };
-
-    if !effective_config.enabled {
+    if !state.agent.config.enabled {
         return json!({
             "task_id": task_ref,
-            "status": "failure",
+            "status": "failed",
             "shell_spent": 0.0,
             "artifacts_written": [],
             "error": "AGENT_DISABLED",
         });
     }
 
-    // Resolve task reference to authoritative task fact (fail fast on error)
-    let resolved = match crate::agent::resolve::resolve_task(
-        &state.memory,
-        &task_ref,
-        agent_id,
-        key,
-        swarm_id,
+    // Resolve task reference to authoritative task fact (fail fast on error).
+    // Watch/courier dispatch ignores this handler's return value, so resolve
+    // timeouts must persist a terminal failed task result before returning.
+    let resolved = match tokio::time::timeout(
+        state.agent.config.bootstrap_memory_timeout,
+        crate::agent::resolve::resolve_task(&state.memory, &task_ref, agent_id, work_key, swarm_id),
     )
     .await
     {
-        Ok(r) => r,
-        Err(e) => {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             return json!({
                 "task_id": task_ref,
-                "status": "failure",
+                "status": "failed",
                 "shell_spent": 0.0,
                 "artifacts_written": [],
                 "error": e.to_string(),
             });
+        }
+        Err(_) => {
+            let task_result = state
+                .agent
+                .finish_bootstrap_resolve_timeout(
+                    agent_id,
+                    swarm_id,
+                    &task_ref,
+                    work_key,
+                    context_key,
+                    budget,
+                )
+                .await;
+            return serde_json::to_value(&task_result)
+                .unwrap_or(json!({"error": "serialization failed"}));
         }
     };
 
@@ -92,7 +89,7 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
     {
         let mut counts = state.in_flight_by_agent.lock().await;
         let current = counts.get(agent_id).copied().unwrap_or(0);
-        if current >= effective_config.max_parallel_tasks {
+        if current >= state.agent.config.max_parallel_tasks {
             let mut in_flight = state.in_flight_tasks.lock().await;
             in_flight.remove(&resolved.task_fact_id);
             return json!({
@@ -107,11 +104,10 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
         counts.insert(agent_id.to_string(), current + 1);
     }
 
-    let agent = state.agent.with_config(effective_config);
-
-    // Execute using the resolved task_fact_id (blocking) — results persisted by
-    // agent
-    let run_result = agent.run(agent_id, swarm_id, &resolved.task_fact_id, key, budget).await;
+    let run_result = state
+        .agent
+        .run(agent_id, swarm_id, &resolved.task_fact_id, work_key, context_key, budget)
+        .await;
 
     {
         let mut in_flight = state.in_flight_tasks.lock().await;
@@ -134,7 +130,7 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
         Err(e) => {
             json!({
                 "task_id": task_ref,
-                "status": "failure",
+                "status": "failed",
                 "shell_spent": 0.0,
                 "artifacts_written": [],
                 "error": e.to_string(),
@@ -145,33 +141,52 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::handle;
+    use crate::agent::config::AgentConfig;
     use crate::test_support::test_app_state;
+    use crate::test_support::test_app_state_with_config_and_delays;
     use crate::test_support::wrap_mcp_response;
-
-    fn empty_agent_config_query() -> serde_json::Value {
-        wrap_mcp_response(&json!({"facts": []}))
-    }
 
     fn task_get_response(task_fact: serde_json::Value) -> serde_json::Value {
         wrap_mcp_response(&json!({ "fact": task_fact }))
     }
 
+    fn stored_response() -> serde_json::Value {
+        wrap_mcp_response(&json!({"stored": true}))
+    }
+
+    fn visible_fact_response(
+        kind: &str,
+        id: &str,
+        task_fact_id: &str,
+        status: Option<&str>,
+    ) -> serde_json::Value {
+        wrap_mcp_response(&json!({
+            "facts": [{
+                "id": id,
+                "kind": kind,
+                "metadata": {
+                    "task_fact_id": task_fact_id,
+                    "status": status,
+                }
+            }]
+        }))
+    }
+
     #[tokio::test]
     async fn start_handle_rejects_target_mismatch() {
-        let responses = vec![
-            empty_agent_config_query(),
-            empty_agent_config_query(),
-            task_get_response(json!({
-                "id": "fact-123",
-                "kind": "task",
-                "fact": "Implement feature X",
-                "target": ["agent:other-agent"],
-                "metadata": {"task_id": "ext-task-1"}
-            })),
-        ];
+        let responses = vec![task_get_response(json!({
+            "id": "fact-123",
+            "kind": "task",
+            "fact": "Implement feature X",
+            "target": ["agent:other-agent"],
+            "metadata": {"task_id": "ext-task-1"}
+        }))];
         let (state, _) = test_app_state(responses);
 
         let result = handle(
@@ -186,7 +201,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("failure"));
+        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("failed"));
         assert!(result
             .get("error")
             .and_then(|v| v.as_str())
@@ -196,17 +211,13 @@ mod tests {
 
     #[tokio::test]
     async fn start_handle_rejects_duplicate_in_flight_task() {
-        let responses = vec![
-            empty_agent_config_query(),
-            empty_agent_config_query(),
-            task_get_response(json!({
-                "id": "fact-dup",
-                "kind": "task",
-                "fact": "Implement feature Y",
-                "target": ["agent:planner"],
-                "metadata": {"task_id": "ext-task-2"}
-            })),
-        ];
+        let responses = vec![task_get_response(json!({
+            "id": "fact-dup",
+            "kind": "task",
+            "fact": "Implement feature Y",
+            "target": ["agent:planner"],
+            "metadata": {"task_id": "ext-task-2"}
+        }))];
         let (state, _) = test_app_state(responses);
         state.in_flight_tasks.lock().await.insert("fact-dup".to_string());
 
@@ -223,17 +234,12 @@ mod tests {
         .await;
 
         assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("already_running"));
-        assert_eq!(result.get("task_fact_id").and_then(|v| v.as_str()), Some("fact-dup"));
     }
 
     #[tokio::test]
     async fn start_handle_returns_failure_when_task_is_missing() {
-        let responses = vec![
-            empty_agent_config_query(),
-            empty_agent_config_query(),
-            wrap_mcp_response(&json!(null)),
-            wrap_mcp_response(&json!({"facts": []})),
-        ];
+        let responses =
+            vec![wrap_mcp_response(&json!(null)), wrap_mcp_response(&json!({"facts": []}))];
         let (state, _) = test_app_state(responses);
 
         let result = handle(
@@ -248,7 +254,98 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("failure"));
+        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("failed"));
         assert!(result.get("error").and_then(|v| v.as_str()).unwrap_or("").contains("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn start_handle_persists_terminal_failure_when_prerun_resolve_times_out() {
+        let responses = vec![
+            stored_response(),
+            visible_fact_response(
+                "task_result",
+                "task_result_fact-timeout",
+                "fact-timeout",
+                Some("failed"),
+            ),
+            stored_response(),
+            visible_fact_response(
+                "task_session",
+                "task_session_fact-timeout",
+                "fact-timeout",
+                Some("failed"),
+            ),
+        ];
+        let mut delays = HashMap::new();
+        delays.insert("memory_get".to_string(), Duration::from_secs(5));
+        let failure_dir = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            bootstrap_memory_timeout: Duration::from_millis(50),
+            local_failure_artifact_dir: Some(failure_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let (state, mock_state) = test_app_state_with_config_and_delays(config, responses, delays);
+
+        let result = handle(
+            &state,
+            &json!({
+                "agent_id": "planner",
+                "swarm_id": "swarm-alpha",
+                "key": "proj-a",
+                "context_key": "ctx-a",
+                "task_id": "fact-timeout",
+                "budget_shell": 10.0,
+            }),
+        )
+        .await;
+
+        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert!(result
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("BOOTSTRAP_RESOLVE_TIMEOUT"));
+        assert_eq!(
+            result.get("artifacts_written").and_then(|v| v.as_array()).map(|v| v.len()),
+            Some(3)
+        );
+        let artifact_path = failure_dir.path().join("task_failure_fact-timeout.json");
+        let artifact: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&artifact_path).unwrap()).unwrap();
+        assert_eq!(
+            artifact.get("source").and_then(|v| v.as_str()),
+            Some("local_task_failure_fallback")
+        );
+        assert_eq!(artifact.get("schema_version").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(artifact.get("task_id").and_then(|v| v.as_str()), Some("fact-timeout"));
+        assert_eq!(artifact.get("phase").and_then(|v| v.as_str()), Some("bootstrap_resolve"));
+        assert_eq!(artifact.get("memory_persisted").and_then(|v| v.as_bool()), Some(true));
+
+        let calls = mock_state.lock().calls.clone();
+        let result_call = calls
+            .iter()
+            .find(|(name, args)| {
+                name == "memory_ingest_asserted_facts"
+                    && args
+                        .get("facts")
+                        .and_then(|v| v.as_array())
+                        .and_then(|facts| facts.first())
+                        .and_then(|fact| fact.get("kind"))
+                        .and_then(|v| v.as_str())
+                        == Some("task_result")
+            })
+            .expect("start resolve timeout should persist canonical task_result");
+        let metadata = result_call
+            .1
+            .get("facts")
+            .and_then(|v| v.as_array())
+            .and_then(|facts| facts.first())
+            .and_then(|fact| fact.get("metadata"))
+            .unwrap();
+        assert_eq!(metadata.get("task_fact_id").and_then(|v| v.as_str()), Some("fact-timeout"));
+        assert_eq!(metadata.get("task_id").and_then(|v| v.as_str()), Some("fact-timeout"));
+        assert_eq!(metadata.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(metadata.get("phase").and_then(|v| v.as_str()), Some("bootstrap_resolve"));
+        assert_eq!(metadata.get("complete").and_then(|v| v.as_bool()), Some(true));
     }
 }

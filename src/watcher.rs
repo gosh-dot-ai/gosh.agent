@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +21,7 @@ const COURIER_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// Configuration for watch mode.
 pub struct WatchConfig {
     pub key: String,
+    pub context_key: String,
     pub agent_id: String,
     pub swarm_id: String,
     pub poll_interval: Duration,
@@ -133,8 +134,6 @@ async fn poll_loop(config: &WatchConfig, app_state: Arc<AppState>, memory: &Arc<
                 }
             }
             Err(e) => {
-                // Transient memory errors: log and retry on next tick,
-                // do not kill the watch loop.
                 warn!(error = %e, "poll failed (transient), will retry next tick");
             }
         }
@@ -184,7 +183,6 @@ async fn poll_once(
         }
 
         if !app_state.claim_dispatch(task_fact_id).await {
-            info!(task_fact_id = task_fact_id, "poll: skipping already-dispatched task");
             continue;
         }
 
@@ -195,6 +193,7 @@ async fn poll_once(
             "agent_id": config.agent_id,
             "swarm_id": config.swarm_id,
             "key": config.key,
+            "context_key": config.context_key,
             "task_id": task_fact_id,
             "budget_shell": config.budget_shell,
         });
@@ -291,6 +290,40 @@ mod tests {
         let memory = Arc::new(MemoryMcpClient::new(transport));
         let config = WatchConfig {
             key: "proj-a".to_string(),
+            context_key: "proj-a-context".to_string(),
+            agent_id: "planner".to_string(),
+            swarm_id: "swarm-alpha".to_string(),
+            poll_interval: Duration::from_secs(30),
+            budget_shell: 10.0,
+        };
+
+        let has_result = check_has_result(&memory, &config, "fact-123").await;
+
+        assert!(has_result);
+    }
+
+    #[tokio::test]
+    async fn check_has_result_treats_failed_bootstrap_result_as_complete() {
+        let canonical_result = wrap_mcp_response(&json!({
+            "facts": [{
+                "id": "task_result_fact-123",
+                "kind": "task_result",
+                "fact": "Task fact-123 finished with status failed: BOOTSTRAP_RECALL_TIMEOUT",
+                "metadata": {
+                    "task_fact_id": "fact-123",
+                    "task_id": "case-1",
+                    "status": "failed",
+                    "phase": "bootstrap_recall",
+                    "complete": true,
+                    "error": "BOOTSTRAP_RECALL_TIMEOUT"
+                }
+            }]
+        }));
+        let (transport, _) = MockTransport::new(vec![canonical_result]);
+        let memory = Arc::new(MemoryMcpClient::new(transport));
+        let config = WatchConfig {
+            key: "proj-a".to_string(),
+            context_key: "proj-a-context".to_string(),
             agent_id: "planner".to_string(),
             swarm_id: "swarm-alpha".to_string(),
             poll_interval: Duration::from_secs(30),
@@ -316,6 +349,7 @@ mod tests {
         let memory = Arc::new(MemoryMcpClient::new(transport));
         let config = WatchConfig {
             key: "proj-a".to_string(),
+            context_key: "proj-a-context".to_string(),
             agent_id: "planner".to_string(),
             swarm_id: "swarm-alpha".to_string(),
             poll_interval: Duration::from_secs(30),

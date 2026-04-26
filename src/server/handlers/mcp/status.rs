@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use serde_json::json;
 use serde_json::Value;
@@ -13,7 +13,7 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
         None => return json!({"error": "task_id is required", "code": "MISSING_PARAM"}),
     };
     let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("default");
-    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("default");
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(&state.agent_id);
     let swarm_id = args.get("swarm_id").and_then(|v| v.as_str()).unwrap_or("default");
 
     // Resolve task reference to authoritative task fact (fail fast)
@@ -39,6 +39,8 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
     // Canonical: latest session via metadata.task_fact_id
     let session_fact =
         query_latest_fact(state, key, agent_id, swarm_id, "task_session", task_fact_id).await;
+    let deliverable_fact =
+        query_latest_terminal_deliverable(state, key, agent_id, swarm_id, task_fact_id).await;
 
     // Legacy fallback if canonical returned nothing
     let result_fact = match result_fact {
@@ -61,7 +63,7 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
         }
     };
 
-    if result_fact.is_none() && session_fact.is_none() {
+    if result_fact.is_none() && session_fact.is_none() && deliverable_fact.is_none() {
         return json!({
             "task_id": task_ref,
             "task_fact_id": task_fact_id,
@@ -70,7 +72,13 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
         });
     }
 
-    build_status_response(task_ref, task_fact_id, result_fact.as_ref(), session_fact.as_ref())
+    build_status_response(
+        task_ref,
+        task_fact_id,
+        result_fact.as_ref(),
+        session_fact.as_ref(),
+        deliverable_fact.as_ref(),
+    )
 }
 
 /// Query latest artifact by kind + metadata.task_fact_id (canonical).
@@ -91,6 +99,34 @@ async fn query_latest_fact(
             filter: json!({
                 "kind": kind,
                 "metadata.task_fact_id": task_fact_id,
+            }),
+            sort_by: Some("created_at".to_string()),
+            sort_order: Some("desc".to_string()),
+            limit: Some(1),
+        })
+        .await
+        .ok()?;
+
+    result.get("facts").and_then(|v| v.as_array()).and_then(|arr| arr.first()).cloned()
+}
+
+async fn query_latest_terminal_deliverable(
+    state: &AppState,
+    key: &str,
+    agent_id: &str,
+    swarm_id: &str,
+    task_fact_id: &str,
+) -> Option<Value> {
+    let result = state
+        .memory
+        .memory_query(MemoryQueryParams {
+            key: key.to_string(),
+            agent_id: agent_id.to_string(),
+            swarm_id: swarm_id.to_string(),
+            filter: json!({
+                "kind": "task_deliverable",
+                "metadata.task_fact_id": task_fact_id,
+                "metadata.artifact_role": "terminal",
             }),
             sort_by: Some("created_at".to_string()),
             sort_order: Some("desc".to_string()),
@@ -165,11 +201,22 @@ fn derive_effective_status(
         .and_then(|v| v.as_str())
         .and_then(normalize_status);
 
-    if let Some(status) = result_status {
-        return status.to_string();
+    if latest_result.is_some() && latest_session.is_none() {
+        return match result_status {
+            Some("done") => "failed".to_string(),
+            Some(status) => status.to_string(),
+            None => "failed".to_string(),
+        };
     }
 
     if let Some(status) = session_status {
+        if status == "done" && latest_result.is_none() {
+            return "failed".to_string();
+        }
+        return status.to_string();
+    }
+
+    if let Some(status) = result_status {
         return status.to_string();
     }
 
@@ -188,11 +235,31 @@ fn derive_effective_status(
     base_status.to_string()
 }
 
+fn incomplete_persistence_error(
+    latest_result: Option<&Value>,
+    latest_session: Option<&Value>,
+) -> Option<&'static str> {
+    if latest_result.is_some() && latest_session.is_none() {
+        return Some("INCOMPLETE_PERSISTENCE: canonical task_session missing");
+    }
+    if latest_result.is_none() && latest_session.is_some() {
+        let session_status = fact_metadata(latest_session)
+            .and_then(|m| m.get("status"))
+            .and_then(|v| v.as_str())
+            .and_then(normalize_status);
+        if session_status == Some("done") {
+            return Some("INCOMPLETE_PERSISTENCE: canonical task_result missing");
+        }
+    }
+    None
+}
+
 fn build_status_response(
     task_ref: &str,
     task_fact_id: &str,
     latest_result: Option<&Value>,
     latest_session: Option<&Value>,
+    latest_deliverable: Option<&Value>,
 ) -> Value {
     let base_status = fact_metadata(latest_session)
         .and_then(|m| m.get("status"))
@@ -203,6 +270,7 @@ fn build_status_response(
         .unwrap_or("active");
     let runtime_meta = fact_metadata(latest_session).or_else(|| fact_metadata(latest_result));
     let effective_status = derive_effective_status(base_status, latest_result, latest_session);
+    let persistence_error = incomplete_persistence_error(latest_result, latest_session);
 
     json!({
         "telemetry_version": 1,
@@ -213,6 +281,15 @@ fn build_status_response(
         "result": fact_text(latest_result),
         "session_fact": latest_session.cloned(),
         "result_fact": latest_result.cloned(),
+        "deliverable_fact": latest_deliverable.cloned(),
+        "deliverable_fact_id": latest_deliverable
+            .and_then(|fact| fact.get("id"))
+            .and_then(|v| v.as_str()),
+        "deliverable_kind": latest_deliverable
+            .and_then(|fact| fact.get("metadata"))
+            .and_then(|meta| meta.get("deliverable_kind"))
+            .and_then(|v| v.as_str())
+            .or_else(|| runtime_meta.and_then(|m| m.get("deliverable_kind")).and_then(|v| v.as_str())),
         "phase": runtime_meta.and_then(|m| m.get("phase")).and_then(|v| v.as_str()),
         "iteration": runtime_meta.and_then(|m| m.get("iteration")).and_then(|v| v.as_u64()),
         "shell_spent": runtime_meta.and_then(|m| m.get("shell_spent")).and_then(|v| v.as_f64()),
@@ -220,7 +297,10 @@ fn build_status_response(
         "backend_used": runtime_meta.and_then(|m| m.get("backend_used")).and_then(|v| v.as_str()),
         "started_at": runtime_meta.and_then(|m| m.get("started_at")).and_then(|v| v.as_str()),
         "finished_at": runtime_meta.and_then(|m| m.get("finished_at")).and_then(|v| v.as_str()),
-        "error": runtime_meta.and_then(|m| m.get("error")).and_then(|v| v.as_str()),
+        "error": runtime_meta
+            .and_then(|m| m.get("error"))
+            .and_then(|v| v.as_str())
+            .or(persistence_error),
         "tool_trace": runtime_meta.and_then(|m| m.get("tool_trace")).cloned(),
     })
 }
@@ -234,13 +314,13 @@ mod tests {
     use super::normalize_status;
 
     #[test]
-    fn effective_status_prefers_latest_result() {
+    fn effective_status_result_without_session_is_incomplete_failure() {
         let status = derive_effective_status(
             "active",
             Some(&json!({"kind":"task_result","fact":"ok","metadata":{"status":"done"}})),
             None,
         );
-        assert_eq!(status, "done");
+        assert_eq!(status, "failed");
     }
 
     #[test]
@@ -270,6 +350,18 @@ mod tests {
     #[test]
     fn effective_status_falls_back_to_base_status() {
         let status = derive_effective_status("active", None, None);
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn effective_status_stays_active_while_final_session_is_missing() {
+        let status = derive_effective_status(
+            "active",
+            Some(&json!({"kind":"task_result","fact":"ok","metadata":{"status":"done"}})),
+            Some(
+                &json!({"kind":"task_session","fact":"persisting","metadata":{"status":"running"}}),
+            ),
+        );
         assert_eq!(status, "active");
     }
 
@@ -311,6 +403,7 @@ mod tests {
                     "tool_trace": ["memory_recall:ok"],
                 }
             })),
+            None,
         );
 
         assert_eq!(result.get("telemetry_version").and_then(|v| v.as_u64()), Some(1));
@@ -323,5 +416,64 @@ mod tests {
         assert_eq!(result.get("tool_trace").and_then(|v| v.as_array()).map(|v| v.len()), Some(1));
         assert!(result.get("session_fact").is_some());
         assert!(result.get("result_fact").is_some());
+    }
+
+    #[test]
+    fn build_status_response_done_task_includes_canonical_session_fact() {
+        let result = build_status_response(
+            "task-1",
+            "fact-1",
+            Some(&json!({
+                "kind": "task_result",
+                "fact": "Final answer",
+                "metadata": {
+                    "status": "done",
+                    "task_fact_id": "fact-1",
+                    "task_id": "task-1",
+                }
+            })),
+            Some(&json!({
+                "kind": "task_session",
+                "fact": "Agent worker completed task task-1 with status done.",
+                "metadata": {
+                    "status": "done",
+                    "task_fact_id": "fact-1",
+                    "task_id": "task-1",
+                    "phase": "review",
+                }
+            })),
+            None,
+        );
+
+        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("done"));
+        assert_eq!(
+            result.get("session_fact").and_then(|v| v.get("kind")).and_then(|v| v.as_str()),
+            Some("task_session")
+        );
+    }
+
+    #[test]
+    fn build_status_response_marks_missing_session_as_incomplete_persistence_failure() {
+        let result = build_status_response(
+            "task-1",
+            "fact-1",
+            Some(&json!({
+                "kind": "task_result",
+                "fact": "Final answer",
+                "metadata": {
+                    "status": "done",
+                    "task_fact_id": "fact-1",
+                    "task_id": "task-1",
+                }
+            })),
+            None,
+            None,
+        );
+
+        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(
+            result.get("error").and_then(|v| v.as_str()),
+            Some("INCOMPLETE_PERSISTENCE: canonical task_session missing")
+        );
     }
 }

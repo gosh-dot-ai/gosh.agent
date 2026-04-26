@@ -1,11 +1,12 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use anyhow::bail;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use super::anthropic::AnthropicProvider;
 use super::LlmProvider;
@@ -21,9 +22,9 @@ const INCEPTION_BASE_URL: &str = "https://api.inceptionlabs.ai/v1";
 
 pub struct MultiProvider {
     anthropic: Option<AnthropicProvider>,
-    openai_api_key: Option<String>,
-    groq_api_key: Option<String>,
-    inception_api_key: Option<String>,
+    openai_api_key: Option<Zeroizing<String>>,
+    groq_api_key: Option<Zeroizing<String>>,
+    inception_api_key: Option<Zeroizing<String>>,
     http: reqwest::Client,
 }
 
@@ -36,11 +37,22 @@ impl MultiProvider {
     ) -> Self {
         Self {
             anthropic: anthropic_api_key.map(AnthropicProvider::new),
-            openai_api_key,
-            groq_api_key,
-            inception_api_key,
+            openai_api_key: openai_api_key.map(Zeroizing::new),
+            groq_api_key: groq_api_key.map(Zeroizing::new),
+            inception_api_key: inception_api_key.map(Zeroizing::new),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Build from a map of resolved (decrypted) secrets keyed by canonical
+    /// secret name. Keys: "anthropic", "openai", "groq", "inception".
+    pub fn from_resolved_secrets(secrets: &std::collections::HashMap<String, String>) -> Self {
+        Self::new(
+            secrets.get("anthropic").cloned(),
+            secrets.get("openai").cloned(),
+            secrets.get("groq").cloned(),
+            secrets.get("inception").cloned(),
+        )
     }
 }
 
@@ -50,6 +62,16 @@ enum ApiRoute {
     OpenAi,
     Groq,
     Inception,
+}
+
+/// Canonical secret name in memory store for a given model.
+pub fn secret_name_for_model(model: &str) -> &'static str {
+    match route_for_model(model) {
+        ApiRoute::Anthropic => "anthropic",
+        ApiRoute::OpenAi => "openai",
+        ApiRoute::Groq => "groq",
+        ApiRoute::Inception => "inception",
+    }
 }
 
 fn route_for_model(model: &str) -> ApiRoute {
@@ -141,6 +163,29 @@ fn parse_openai_content(message: &Value) -> Option<String> {
     }
 }
 
+fn parse_openai_usage(data: &Value) -> Usage {
+    let usage = data.get("usage").unwrap_or(&Value::Null);
+    let completion_tokens =
+        usage.get("completion_tokens").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
+    let reasoning_tokens = usage
+        .get("completion_tokens_details")
+        .and_then(|value| value.get("reasoning_tokens"))
+        .or_else(|| {
+            usage.get("output_tokens_details").and_then(|value| value.get("reasoning_tokens"))
+        })
+        .or_else(|| usage.get("reasoning_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32;
+    Usage {
+        input_tokens: usage.get("prompt_tokens").and_then(|value| value.as_u64()).unwrap_or(0)
+            as u32,
+        output_tokens: completion_tokens.saturating_sub(reasoning_tokens),
+        reasoning_tokens,
+        cached_input_read_tokens: 0,
+        cached_input_write_tokens: 0,
+    }
+}
+
 #[async_trait]
 impl LlmProvider for MultiProvider {
     async fn chat(
@@ -222,18 +267,7 @@ impl LlmProvider for MultiProvider {
             .get("message")
             .ok_or_else(|| anyhow::anyhow!("completion response missing choices[0].message"))?;
 
-        let usage = Usage {
-            input_tokens: data
-                .get("usage")
-                .and_then(|value| value.get("prompt_tokens"))
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
-            output_tokens: data
-                .get("usage")
-                .and_then(|value| value.get("completion_tokens"))
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
-        };
+        let usage = parse_openai_usage(&data);
 
         let tool_calls = message
             .get("tool_calls")
@@ -278,9 +312,13 @@ impl LlmProvider for MultiProvider {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::api_model_name;
+    use super::parse_openai_usage;
     use super::route_for_model;
     use super::ApiRoute;
+    use crate::llm::Usage;
 
     #[test]
     fn route_for_model_matches_expected_provider_family() {
@@ -302,5 +340,72 @@ mod tests {
         assert_eq!(api_model_name("qwen/qwen3-32b", ApiRoute::Groq), "qwen/qwen3-32b");
         assert_eq!(api_model_name("openai/gpt-4.1", ApiRoute::OpenAi), "gpt-4.1");
         assert_eq!(api_model_name("gpt-4.1", ApiRoute::OpenAi), "gpt-4.1");
+    }
+
+    #[test]
+    fn openai_usage_with_reasoning_tokens_populates_usage() {
+        let usage = parse_openai_usage(&json!({
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 40,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 18
+                }
+            }
+        }));
+
+        assert_eq!(
+            usage,
+            Usage {
+                input_tokens: 120,
+                output_tokens: 22,
+                reasoning_tokens: 18,
+                cached_input_read_tokens: 0,
+                cached_input_write_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_reasoning_tokens_default_to_zero() {
+        let usage = parse_openai_usage(&json!({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        }));
+
+        assert_eq!(
+            usage,
+            Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+                cached_input_read_tokens: 0,
+                cached_input_write_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_tokens_are_not_double_billed_in_output_tokens() {
+        let usage = parse_openai_usage(&json!({
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 12,
+                "reasoning_tokens": 7
+            }
+        }));
+
+        assert_eq!(
+            usage,
+            Usage {
+                input_tokens: 50,
+                output_tokens: 5,
+                reasoning_tokens: 7,
+                cached_input_read_tokens: 0,
+                cached_input_write_tokens: 0,
+            }
+        );
     }
 }

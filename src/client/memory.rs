@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use anyhow::Result;
 use serde::Serialize;
@@ -11,6 +11,15 @@ use super::McpTransport;
 
 #[derive(Serialize)]
 pub struct RecallParams {
+    pub key: String,
+    pub agent_id: String,
+    pub swarm_id: String,
+    pub query: String,
+    pub token_budget: i64,
+}
+
+#[derive(Serialize)]
+pub struct PlanInferenceParams {
     pub key: String,
     pub agent_id: String,
     pub swarm_id: String,
@@ -53,7 +62,10 @@ pub struct IngestFactsParams {
     pub key: String,
     pub agent_id: String,
     pub swarm_id: String,
+    pub scope: String,
     pub facts: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enrich_l0: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -118,39 +130,43 @@ impl MemoryMcpClient {
     }
 
     pub async fn recall(&self, params: RecallParams) -> Result<Value> {
-        self.client.call_tool("memory_recall", json!(params)).await
+        self.client.call_tool("memory_recall", serde_json::to_value(params)?).await
+    }
+
+    pub async fn plan_inference(&self, params: PlanInferenceParams) -> Result<Value> {
+        self.client.call_tool("memory_plan_inference", serde_json::to_value(params)?).await
     }
 
     pub async fn store(&self, params: StoreParams) -> Result<Value> {
-        self.client.call_tool("memory_store", json!(params)).await
+        self.client.call_tool("memory_store", serde_json::to_value(params)?).await
     }
 
     pub async fn memory_store(&self, params: MemoryStoreParams) -> Result<Value> {
-        self.client.call_tool("memory_store", json!(params)).await
+        self.client.call_tool("memory_store", serde_json::to_value(params)?).await
     }
 
     pub async fn ingest_asserted_facts(&self, params: IngestFactsParams) -> Result<Value> {
-        self.client.call_tool("memory_ingest_asserted_facts", json!(params)).await
+        self.client.call_tool("memory_ingest_asserted_facts", serde_json::to_value(params)?).await
     }
 
     pub async fn list_facts(&self, params: ListFactsParams) -> Result<Value> {
-        self.client.call_tool("memory_list", json!(params)).await
+        self.client.call_tool("memory_list", serde_json::to_value(params)?).await
     }
 
     pub async fn memory_query(&self, params: MemoryQueryParams) -> Result<Value> {
-        self.client.call_tool("memory_query", json!(params)).await
+        self.client.call_tool("memory_query", serde_json::to_value(params)?).await
     }
 
     pub async fn memory_get(&self, params: MemoryGetParams) -> Result<Value> {
-        self.client.call_tool("memory_get", json!(params)).await
+        self.client.call_tool("memory_get", serde_json::to_value(params)?).await
     }
 
     pub async fn memory_get_config(&self, params: MemoryGetConfigParams) -> Result<Value> {
-        self.client.call_tool("memory_get_config", json!(params)).await
+        self.client.call_tool("memory_get_config", serde_json::to_value(params)?).await
     }
 
     pub async fn courier_subscribe(&self, params: CourierSubscribeParams) -> Result<Value> {
-        self.client.call_tool("courier_subscribe", json!(params)).await
+        self.client.call_tool("courier_subscribe", serde_json::to_value(params)?).await
     }
 
     pub async fn courier_unsubscribe(&self, sub_id: &str) -> Result<Value> {

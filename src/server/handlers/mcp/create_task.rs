@@ -1,10 +1,9 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use serde_json::json;
 use serde_json::Value;
 
-use crate::agent::config_loader;
 use crate::client::memory::IngestFactsParams;
 use crate::client::memory::MemoryQueryParams;
 use crate::client::memory::StoreParams;
@@ -14,7 +13,7 @@ use crate::server::AppState;
 pub(crate) struct CreateTaskRequest {
     agent_id: String,
     swarm_id: String,
-    key: String,
+    work_key: String,
     description: String,
     external_task_id: String,
     target_list: Vec<String>,
@@ -22,10 +21,21 @@ pub(crate) struct CreateTaskRequest {
     metadata: Value,
 }
 
-pub(crate) fn parse_request(args: &Value) -> Result<CreateTaskRequest, Value> {
-    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+pub(crate) fn parse_request(
+    args: &Value,
+    default_agent_id: &str,
+) -> Result<CreateTaskRequest, Value> {
+    let agent_id =
+        args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent_id).to_string();
     let swarm_id = args.get("swarm_id").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+    let work_key = args
+        .get("work_key")
+        .or_else(|| args.get("key"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let context_key =
+        args.get("context_key").and_then(|v| v.as_str()).map(|value| value.to_string());
     let description = match args.get("description").and_then(|v| v.as_str()) {
         Some(d) => d.to_string(),
         None => return Err(json!({"error": "description is required", "code": "MISSING_PARAM"})),
@@ -34,7 +44,10 @@ pub(crate) fn parse_request(args: &Value) -> Result<CreateTaskRequest, Value> {
         args.get("task_id").and_then(|v| v.as_str()).unwrap_or("auto").to_string();
 
     let target_list = normalize_target_list(args.get("target"), &agent_id);
-    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("swarm-shared").to_string();
+    let scope = match args.get("scope").and_then(|v| v.as_str()) {
+        Some(scope) => scope.to_string(),
+        None => return Err(json!({"error": "scope is required", "code": "MISSING_PARAM"})),
+    };
 
     let mut metadata = match args.get("metadata") {
         Some(Value::Object(map)) => Value::Object(map.clone()),
@@ -50,11 +63,15 @@ pub(crate) fn parse_request(args: &Value) -> Result<CreateTaskRequest, Value> {
     if let Some(priority) = args.get("priority") {
         metadata["priority"] = priority.clone();
     }
+    metadata["work_key"] = json!(work_key);
+    if let Some(context_key) = context_key.as_deref() {
+        metadata["context_key"] = json!(context_key);
+    }
 
     Ok(CreateTaskRequest {
         agent_id,
         swarm_id,
-        key,
+        work_key,
         description,
         external_task_id,
         target_list,
@@ -115,7 +132,7 @@ async fn resolve_task_fact_id(
         .agent
         .memory
         .memory_query(MemoryQueryParams {
-            key: request.key.clone(),
+            key: request.work_key.clone(),
             agent_id: request.agent_id.clone(),
             swarm_id: request.swarm_id.clone(),
             filter,
@@ -141,10 +158,12 @@ pub(crate) async fn execute_create_task(state: &AppState, request: &CreateTaskRe
         .agent
         .memory
         .ingest_asserted_facts(IngestFactsParams {
-            key: request.key.clone(),
+            key: request.work_key.clone(),
             agent_id: request.agent_id.clone(),
             swarm_id: request.swarm_id.clone(),
+            scope: request.scope.clone(),
             facts: json!([build_authoritative_task_fact(request)]),
+            enrich_l0: None,
         })
         .await;
 
@@ -156,89 +175,44 @@ pub(crate) async fn execute_create_task(state: &AppState, request: &CreateTaskRe
         Err(e) => return json!({"error": e.to_string(), "code": "STORE_ERROR"}),
     };
 
-    let semantic_store_result = state
-        .agent
-        .memory
-        .store(StoreParams {
-            key: request.key.clone(),
-            agent_id: request.agent_id.clone(),
-            swarm_id: request.swarm_id.clone(),
-            content: request.description.clone(),
-            scope: request.scope.clone(),
-            content_type: "default".to_string(),
-            session_num: 1,
-            session_date: chrono::Utc::now().date_naive().to_string(),
-            speakers: "User".to_string(),
-            metadata: Some(request.metadata.clone()),
-            target: Some(request.target_list.clone()),
-        })
-        .await;
-
-    if let Err(e) = semantic_store_result {
-        tracing::warn!(error = %e, "semantic task store failed (non-fatal)");
-    }
-
-    // 2. Optional: extract structured facts from description via LLM (secondary
-    //    payload)
-    let mut n_extracted = 0i64;
-    let mut n_stored = 0i64;
-
-    let extraction_agent = match config_loader::load_agent_config(
-        &state.memory,
-        &state.agent.config,
-        &request.key,
-        &request.agent_id,
-        &request.swarm_id,
-    )
-    .await
-    {
-        Ok(cfg) => state.agent.with_config(cfg),
-        Err(e) => {
-            tracing::warn!(error = %e, "agent config load failed during create_task; using bootstrap config");
-            state.agent.with_config(state.agent.config.clone())
-        }
+    let memory = state.agent.memory.clone();
+    let store_params = StoreParams {
+        key: request.work_key.clone(),
+        agent_id: request.agent_id.clone(),
+        swarm_id: request.swarm_id.clone(),
+        content: request.description.clone(),
+        scope: request.scope.clone(),
+        content_type: "default".to_string(),
+        session_num: 1,
+        session_date: chrono::Utc::now().date_naive().to_string(),
+        speakers: "User".to_string(),
+        metadata: Some(request.metadata.clone()),
+        target: Some(request.target_list.clone()),
     };
+    let task_id = request.external_task_id.clone();
+    // The authoritative task fact above is the reliable create-task contract.
+    // This semantic store is indexing-only best effort and intentionally
+    // detached so slow extraction cannot hold the request open.
+    tokio::spawn(async move {
+        if let Err(e) = memory.store(store_params).await {
+            tracing::warn!(task_id = %task_id, error = %e, "semantic task store failed (non-fatal)");
+        }
+    });
 
-    match extraction_agent.extract_task_facts(&request.external_task_id, &request.description).await
-    {
-        Ok(facts) => {
-            n_extracted = facts.len() as i64;
-            // Ingest extracted facts into memory
-            match state
-                .agent
-                .memory
-                .ingest_asserted_facts(IngestFactsParams {
-                    key: request.key.clone(),
-                    agent_id: request.agent_id.clone(),
-                    swarm_id: request.swarm_id.clone(),
-                    facts: crate::agent::extract::facts_to_value(&facts),
-                })
-                .await
-            {
-                Ok(result) => {
-                    n_stored = result.get("n_granular").and_then(|v| v.as_i64()).unwrap_or(0);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "extracted facts ingest failed (non-fatal)");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "fact extraction failed (non-fatal)");
-        }
-    }
+    // Fact extraction is handled by memory (via librarian_profile) when
+    // the task description is stored asynchronously above. Agent does not
+    // extract facts, and task creation is authoritative once the task fact is
+    // accepted.
 
     json!({
         "task_id": request.external_task_id,
         "task_fact_id": task_fact_id,
         "target": request.target_list,
-        "facts_extracted": n_extracted,
-        "facts_stored": n_stored,
     })
 }
 
 pub async fn handle(state: &AppState, args: &Value) -> Value {
-    match parse_request(args) {
+    match parse_request(args, &state.agent_id) {
         Ok(request) => execute_create_task(state, &request).await,
         Err(err) => err,
     }
@@ -246,7 +220,8 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::time::Duration;
 
     use serde_json::json;
 
@@ -254,9 +229,8 @@ mod tests {
     use super::normalize_target_list;
     use crate::test_support::take_calls;
     use crate::test_support::test_app_state;
-    use crate::test_support::test_app_state_with_llm;
+    use crate::test_support::test_app_state_with_delays;
     use crate::test_support::wrap_mcp_response;
-    use crate::test_support::StaticLlmProvider;
 
     #[test]
     fn normalize_target_list_defaults_to_request_agent() {
@@ -279,8 +253,6 @@ mod tests {
             wrap_mcp_response(&json!({"granular_added": 1})),
             wrap_mcp_response(&json!({"facts": [{"id": "fact-new-1"}]})),
             wrap_mcp_response(&json!({"facts_extracted": 0})),
-            wrap_mcp_response(&json!({"facts": []})),
-            wrap_mcp_response(&json!({"facts": []})),
         ];
         let (state, mock_state) = test_app_state(responses);
 
@@ -290,6 +262,7 @@ mod tests {
                 "agent_id": "planner",
                 "swarm_id": "swarm-alpha",
                 "key": "proj-a",
+                "scope": "swarm-shared",
                 "task_id": "ext-task-42",
                 "description": "Implement feature X",
                 "target": "worker-1",
@@ -306,10 +279,18 @@ mod tests {
             &vec![json!("agent:worker-1")]
         );
 
-        let calls = take_calls(&mock_state);
-        assert_eq!(calls.len(), 5);
+        let mut calls = Vec::new();
+        for _ in 0..20 {
+            calls = mock_state.lock().calls.clone();
+            if calls.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(calls.len(), 3);
         let (tool_name, args) = &calls[0];
         assert_eq!(tool_name, "memory_ingest_asserted_facts");
+        assert_eq!(args.get("scope").unwrap(), "swarm-shared");
         let fact = args
             .get("facts")
             .and_then(|v| v.as_array())
@@ -324,11 +305,14 @@ mod tests {
         assert_eq!(metadata.get("workflow_id").unwrap(), "wf-123");
         assert_eq!(metadata.get("route").unwrap(), "secondary");
         assert_eq!(metadata.get("priority").unwrap(), 5);
+        assert_eq!(metadata.get("work_key").unwrap(), "proj-a");
+        assert!(metadata.get("context_key").is_none());
         let (tool_name, args) = &calls[1];
         assert_eq!(tool_name, "memory_query");
         assert_eq!(args.get("filter").unwrap().get("metadata.task_id").unwrap(), "ext-task-42");
         let (tool_name, args) = &calls[2];
         assert_eq!(tool_name, "memory_store");
+        assert_eq!(args.get("scope").unwrap(), "swarm-shared");
         assert_eq!(args.get("content").unwrap(), "Implement feature X");
         assert_eq!(args.get("target").unwrap(), &json!(["agent:worker-1"]));
         let metadata = args.get("metadata").unwrap();
@@ -336,56 +320,42 @@ mod tests {
         assert_eq!(metadata.get("workflow_id").unwrap(), "wf-123");
         assert_eq!(metadata.get("route").unwrap(), "secondary");
         assert_eq!(metadata.get("priority").unwrap(), 5);
-        assert_eq!(calls[3].0, "memory_query");
-        assert_eq!(calls[4].0, "memory_query");
+        assert_eq!(metadata.get("work_key").unwrap(), "proj-a");
     }
 
     #[tokio::test]
-    async fn create_task_handle_ingests_secondary_facts_without_breaking_authoritative_write() {
-        let extraction_json = json!({
-            "facts": [{
-                "id": "f_01",
-                "fact": "Repository is Rust",
-                "kind": "fact",
-                "entities": ["repo"],
-                "tags": ["rust"]
-            }]
-        });
+    async fn create_task_returns_before_slow_semantic_store() {
         let responses = vec![
             wrap_mcp_response(&json!({"granular_added": 1})),
-            wrap_mcp_response(&json!({"facts": [{"id": "fact-new-2"}]})),
+            wrap_mcp_response(&json!({"facts": [{"id": "fact-new-1"}]})),
             wrap_mcp_response(&json!({"facts_extracted": 0})),
-            wrap_mcp_response(&json!({"facts": []})),
-            wrap_mcp_response(&json!({"facts": []})),
-            wrap_mcp_response(&json!({"n_granular": 1})),
         ];
-        let llm = Arc::new(StaticLlmProvider::new(extraction_json.to_string()));
-        let (state, mock_state) = test_app_state_with_llm(responses, Some(llm));
+        let mut delays = HashMap::new();
+        delays.insert("memory_store".to_string(), Duration::from_secs(5));
+        let (state, mock_state) = test_app_state_with_delays(responses, delays);
 
-        let result = handle(
-            &state,
-            &json!({
-                "agent_id": "planner",
-                "swarm_id": "swarm-alpha",
-                "key": "proj-a",
-                "task_id": "ext-task-43",
-                "description": "Implement feature Y",
-                "target": ["agent:worker-2"],
-            }),
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            handle(
+                &state,
+                &json!({
+                    "agent_id": "planner",
+                    "swarm_id": "swarm-alpha",
+                    "key": "proj-a",
+                    "scope": "swarm-shared",
+                    "task_id": "ext-task-42",
+                    "description": "Implement feature X",
+                    "target": "worker-1",
+                }),
+            ),
         )
-        .await;
+        .await
+        .expect("create-task should not wait for semantic memory_store");
 
-        assert_eq!(result.get("task_fact_id").and_then(|v| v.as_str()), Some("fact-new-2"));
-        assert_eq!(result.get("facts_extracted").and_then(|v| v.as_i64()), Some(1));
-        assert_eq!(result.get("facts_stored").and_then(|v| v.as_i64()), Some(1));
-
+        assert_eq!(result.get("task_fact_id").and_then(|v| v.as_str()), Some("fact-new-1"));
         let calls = take_calls(&mock_state);
-        assert_eq!(calls.len(), 6);
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "memory_ingest_asserted_facts");
         assert_eq!(calls[1].0, "memory_query");
-        assert_eq!(calls[2].0, "memory_store");
-        assert_eq!(calls[3].0, "memory_query");
-        assert_eq!(calls[4].0, "memory_query");
-        assert_eq!(calls[5].0, "memory_ingest_asserted_facts");
     }
 }

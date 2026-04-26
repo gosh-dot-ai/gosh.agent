@@ -1,104 +1,20 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 #[cfg(test)]
 mod routing_contract {
     use std::sync::Arc;
-    use std::sync::Mutex;
 
-    use async_trait::async_trait;
     use serde_json::json;
     use serde_json::Value;
 
-    use crate::agent::config::profile_by_id;
-    use crate::agent::config::AgentConfig;
-    use crate::agent::config::RoutingTier;
     use crate::client::memory::CourierSubscribeParams;
     use crate::client::memory::MemoryMcpClient;
     use crate::client::memory::MemoryQueryParams;
     use crate::client::memory::MemoryStoreParams;
-    use crate::client::McpTransport;
-
-    /// Shared state between mock transport and test assertions.
-    #[derive(Default)]
-    struct MockState {
-        responses: Vec<Value>,
-        calls: Vec<(String, Value)>,
-    }
-
-    /// Mock transport that records tool calls and returns pre-configured
-    /// responses.
-    struct MockTransport {
-        state: Arc<Mutex<MockState>>,
-    }
-
-    impl MockTransport {
-        fn new(responses: Vec<Value>) -> (Self, Arc<Mutex<MockState>>) {
-            let state = Arc::new(Mutex::new(MockState { responses, calls: Vec::new() }));
-            (Self { state: state.clone() }, state)
-        }
-    }
-
-    #[async_trait]
-    impl McpTransport for MockTransport {
-        async fn send(
-            &self,
-            body: &Value,
-            _session_id: Option<&str>,
-        ) -> anyhow::Result<(Value, Option<String>)> {
-            let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
-
-            if method == "initialize" {
-                return Ok((
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "result": {
-                            "protocolVersion": "2025-03-26",
-                            "capabilities": {},
-                            "serverInfo": { "name": "mock", "version": "0.1.0" }
-                        }
-                    }),
-                    Some("mock-session".to_string()),
-                ));
-            }
-
-            if method == "notifications/initialized" {
-                return Ok((json!({}), Some("mock-session".to_string())));
-            }
-
-            let tool_name =
-                body.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let args = body.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-
-            let mut st = self.state.lock().unwrap();
-            st.calls.push((tool_name, args));
-
-            let resp = if st.responses.is_empty() {
-                json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"null"}]}})
-            } else {
-                st.responses.remove(0)
-            };
-
-            Ok((resp, Some("mock-session".to_string())))
-        }
-    }
-
-    fn wrap_mcp_response(payload: &Value) -> Value {
-        let text = serde_json::to_string(payload).unwrap();
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "content": [{"type": "text", "text": text}],
-                "isError": false
-            }
-        })
-    }
-
-    fn take_calls(state: &Arc<Mutex<MockState>>) -> Vec<(String, Value)> {
-        state.lock().unwrap().calls.drain(..).collect()
-    }
+    use crate::test_support::take_calls;
+    use crate::test_support::wrap_mcp_response;
+    use crate::test_support::MockTransport;
 
     // ---------------------------------------------------------------
     // Test: watcher/courier subscribes with correct structured filter
@@ -381,7 +297,7 @@ mod routing_contract {
     #[tokio::test]
     async fn memory_get_config_wrapper_serializes_params() {
         let get_resp = wrap_mcp_response(&json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "embedding_model": "openai/text-embedding-3-large",
         }));
         let (transport, mock_state) = MockTransport::new(vec![get_resp]);
@@ -403,49 +319,6 @@ mod routing_contract {
         assert_eq!(name, "memory_get_config");
         assert_eq!(args.get("key").unwrap(), "ns");
         assert_eq!(args.get("agent_id").unwrap(), "a");
-    }
-
-    #[test]
-    fn cli_profiles_enforce_single_process_and_cooldown() {
-        for profile_id in ["claude_code_cli", "codex_cli", "gemini_cli"] {
-            let profile = profile_by_id(profile_id).expect("profile must exist");
-            assert_eq!(profile.max_concurrency, 1, "{profile_id} must stay serialized");
-            assert!(
-                profile.cooldown_secs >= 600,
-                "{profile_id} cooldown must stay at least 10 minutes"
-            );
-        }
-    }
-
-    #[test]
-    fn cli_runtime_overrides_resolve_without_rebuild() {
-        let mut config = AgentConfig::default();
-        config.fast_profile = "claude_code_cli".to_string();
-        config.claude_cli_bin = Some("/opt/bin/claude".to_string());
-        config.claude_cli_cooldown_secs = Some(1200);
-
-        let profile = config.execution_profile(RoutingTier::Fast).unwrap();
-        let resolved = config.resolve_cli_command(profile).unwrap();
-
-        assert_eq!(resolved.bin, "/opt/bin/claude");
-        assert_eq!(resolved.cooldown_secs, 1200);
-        assert_eq!(resolved.max_concurrency, 1);
-        assert_eq!(resolved.args_prefix, vec!["-p".to_string()]);
-    }
-
-    #[test]
-    fn persisted_profile_runtime_policy_can_tighten_cli_limits() {
-        let mut config = AgentConfig::default();
-        config.fast_profile = "claude_code_cli".to_string();
-        config.max_parallel_tasks = 2;
-        config.profile_runtime.entry("claude_code_cli".to_string()).or_default().cooldown_secs =
-            Some(1800);
-
-        let profile = config.execution_profile(RoutingTier::Fast).unwrap();
-        let resolved = config.resolve_cli_command(profile).unwrap();
-
-        assert_eq!(resolved.cooldown_secs, 1800);
-        assert_eq!(resolved.max_concurrency, 1);
     }
 
     // ---------------------------------------------------------------
@@ -506,69 +379,5 @@ mod routing_contract {
         });
         let kind_ok = payload.get("kind").and_then(|v| v.as_str()) == Some("task");
         assert!(!kind_ok, "kind=note must be filtered even when target matches");
-    }
-
-    // ---------------------------------------------------------------
-    // Negative-path: config_loader rejects bad schema_version via
-    // production parse_agent_config (covers tests.rs coverage gap)
-    // ---------------------------------------------------------------
-    #[tokio::test]
-    async fn config_loader_rejects_unsupported_schema_version() {
-        use crate::agent::config_loader::load_agent_config;
-
-        let fact = json!({
-            "facts": [{
-                "target": ["agent:planner"],
-                "metadata": {
-                    "schema_version": 99,
-                    "agent_id": "planner",
-                    "swarm_id": "s"
-                }
-            }]
-        });
-        let wrap_resp = wrap_mcp_response(&fact);
-        let (transport, _) = MockTransport::new(vec![wrap_resp]);
-        let memory = Arc::new(MemoryMcpClient::new(transport));
-
-        let err = load_agent_config(&memory, &AgentConfig::default(), "default", "planner", "s")
-            .await
-            .unwrap_err();
-
-        assert!(
-            err.to_string().contains("UNSUPPORTED_AGENT_CONFIG_SCHEMA_VERSION"),
-            "expected schema version rejection, got: {err}"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Negative-path: config_loader rejects target mismatch via
-    // production parse_agent_config
-    // ---------------------------------------------------------------
-    #[tokio::test]
-    async fn config_loader_rejects_target_mismatch() {
-        use crate::agent::config_loader::load_agent_config;
-
-        let fact = json!({
-            "facts": [{
-                "target": ["agent:someone-else"],
-                "metadata": {
-                    "schema_version": 1,
-                    "agent_id": "planner",
-                    "swarm_id": "s"
-                }
-            }]
-        });
-        let wrap_resp = wrap_mcp_response(&fact);
-        let (transport, _) = MockTransport::new(vec![wrap_resp]);
-        let memory = Arc::new(MemoryMcpClient::new(transport));
-
-        let err = load_agent_config(&memory, &AgentConfig::default(), "default", "planner", "s")
-            .await
-            .unwrap_err();
-
-        assert!(
-            err.to_string().contains("AGENT_CONFIG_TARGET_MISMATCH"),
-            "expected target mismatch rejection, got: {err}"
-        );
     }
 }

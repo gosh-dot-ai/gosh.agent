@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use anyhow::bail;
 use anyhow::Result;
@@ -13,12 +13,21 @@ const PREFIX: &str = "gosh_join_";
 pub struct JoinToken {
     /// Memory server URL (e.g. "https://192.168.1.10:8765")
     pub url: String,
-    /// Auth token for x-server-token header
-    pub token: String,
-    /// SHA-256 fingerprint of the server's TLS certificate (hex)
-    pub fingerprint: String,
-    /// PEM-encoded server certificate (for TLS pinning)
-    pub ca: String,
+    /// Optional transport/perimeter token for x-server-token.
+    #[serde(default, alias = "token")]
+    pub transport_token: Option<String>,
+    /// Principal identity carried by the bundle for local persistence.
+    #[serde(default)]
+    pub principal_id: Option<String>,
+    /// Optional principal bearer token for Authorization header.
+    #[serde(default, alias = "principal_auth_token")]
+    pub principal_token: Option<String>,
+    /// SHA-256 fingerprint of the server's TLS certificate (hex).
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    /// PEM-encoded server certificate (for TLS pinning).
+    #[serde(default)]
+    pub ca: Option<String>,
 }
 
 impl JoinToken {
@@ -36,26 +45,18 @@ impl JoinToken {
             .ok_or_else(|| anyhow::anyhow!("join token must start with '{PREFIX}'"))?;
         let json = base64url_decode(b64)?;
         let token: Self = serde_json::from_slice(&json)?;
-        if token.url.is_empty() || token.token.is_empty() {
-            bail!("join token has empty url or token");
+        if token.url.is_empty() {
+            bail!("join token has empty url");
         }
-        if !token.url.starts_with("https://") {
-            bail!("join token URL must use https:// (got: {})", token.url);
+        let has_transport = token.transport_token.as_deref().is_some_and(|v| !v.is_empty());
+        let has_principal = token.principal_token.as_deref().is_some_and(|v| !v.is_empty());
+        if !has_transport && !has_principal {
+            bail!("join token must include transport_token or principal_token");
+        }
+        if !token.url.starts_with("https://") && !token.url.starts_with("http://") {
+            bail!("join token URL must use http:// or https:// (got: {})", token.url);
         }
         Ok(token)
-    }
-
-    /// Build a reqwest Client that trusts only this server's certificate.
-    pub fn build_http_client(&self) -> Result<reqwest::Client> {
-        let cert = reqwest::Certificate::from_pem(self.ca.as_bytes())
-            .map_err(|e| anyhow::anyhow!("invalid CA in join token: {e}"))?;
-
-        let client = reqwest::Client::builder()
-            .tls_certs_only([cert])
-            .danger_accept_invalid_hostnames(true)
-            .build()?;
-
-        Ok(client)
     }
 }
 
@@ -122,15 +123,19 @@ mod tests {
     fn roundtrip() {
         let token = JoinToken {
             url: "https://192.168.1.10:8765".to_string(),
-            token: "secret123".to_string(),
-            fingerprint: "sha256:abcdef".to_string(),
-            ca: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_string(),
+            transport_token: Some("secret123".to_string()),
+            principal_id: Some("agent:planner".to_string()),
+            principal_token: Some("principal-secret".to_string()),
+            fingerprint: Some("sha256:abcdef".to_string()),
+            ca: Some("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_string()),
         };
         let encoded = token.encode().unwrap();
         assert!(encoded.starts_with("gosh_join_"));
         let decoded = JoinToken::decode(&encoded).unwrap();
         assert_eq!(decoded.url, "https://192.168.1.10:8765");
-        assert_eq!(decoded.token, "secret123");
-        assert_eq!(decoded.fingerprint, "sha256:abcdef");
+        assert_eq!(decoded.transport_token.as_deref(), Some("secret123"));
+        assert_eq!(decoded.principal_id.as_deref(), Some("agent:planner"));
+        assert_eq!(decoded.principal_token.as_deref(), Some("principal-secret"));
+        assert_eq!(decoded.fingerprint.as_deref(), Some("sha256:abcdef"));
     }
 }

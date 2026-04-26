@@ -1,5 +1,5 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
-// License: MIT
+// SPDX-License-Identifier: MIT
 
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::server::AppState;
 
 pub async fn handle(state: Arc<AppState>, args: &Value) -> Value {
-    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("default");
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(&state.agent_id);
     let swarm_id = args.get("swarm_id").and_then(|v| v.as_str()).unwrap_or("default");
     let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("default");
 

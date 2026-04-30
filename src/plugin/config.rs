@@ -13,6 +13,16 @@ use sha2::Digest;
 use sha2::Sha256;
 
 /// Per-instance config: ~/.gosh/agent/state/{name}/config.toml
+///
+/// This is the single source of truth for everything about an agent
+/// instance. `gosh agent setup` is the canonical writer (via
+/// `gosh-agent setup`), and re-running setup with a subset of flags
+/// patches the existing values rather than overwriting them, so
+/// configuration stays atomic across the agent's lifetime.
+///
+/// `gosh agent start` and the autostart artifact (`launchd plist` /
+/// `systemd user unit`) just spawn the daemon; the daemon reads
+/// everything below at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalConfig {
     pub authority_url: String,
@@ -28,6 +38,58 @@ pub struct GlobalConfig {
     /// Swarm ID for captured data. Required for swarm-shared scope.
     #[serde(default)]
     pub swarm_id: Option<String>,
+    /// Daemon HTTP bind host. `None` falls back to `127.0.0.1` at startup.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Daemon HTTP bind port. `None` falls back to `8767` at startup.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Watch loop on/off. When `true`, the daemon's task watcher subscribes
+    /// to memory's courier and dispatches inbound tasks. Independent of MCP
+    /// gateway operation — capture/MCP work whether watch is on or off.
+    #[serde(default)]
+    pub watch: bool,
+    /// Namespace key the watcher subscribes to for task discovery.
+    #[serde(default)]
+    pub watch_key: Option<String>,
+    /// Swarm filter for the watcher's courier subscription.
+    #[serde(default)]
+    pub watch_swarm_id: Option<String>,
+    /// Agent-id filter for the watcher (default: derived from principal_id).
+    #[serde(default)]
+    pub watch_agent_id: Option<String>,
+    /// Context retrieval namespace, distinct from `watch_key` when an agent
+    /// watches one namespace and recalls context from another.
+    #[serde(default)]
+    pub watch_context_key: Option<String>,
+    /// USD budget cap for autonomous task execution (per-task).
+    #[serde(default)]
+    pub watch_budget: Option<f64>,
+    /// Polling interval (seconds) for the watcher loop fallback when courier
+    /// SSE is unavailable.
+    #[serde(default)]
+    pub poll_interval: Option<u64>,
+    /// Whether the daemon's OAuth authorization-server side accepts
+    /// Dynamic Client Registration (RFC 7591) requests at
+    /// `/oauth/register`. When `false`, that endpoint returns
+    /// `405 Method Not Allowed` and the metadata document at
+    /// `/.well-known/oauth-authorization-server` omits
+    /// `registration_endpoint` so Claude.ai's auto-detection falls
+    /// back to expecting manually-issued credentials.
+    ///
+    /// Defaults to `true` — DCR is the spec-default UX path. Operator
+    /// opts out via `gosh agent setup --no-oauth-dcr` when they want
+    /// explicit per-client registration through
+    /// `gosh agent oauth clients register --name <X> --redirect-uri <URI>`.
+    #[serde(default = "default_true")]
+    pub oauth_dcr_enabled: bool,
+}
+
+/// Serde default helper for bool fields whose absence means `true`.
+/// `#[serde(default)]` alone would default to `false`, which is the
+/// wrong fallback for opt-in-by-default fields like `oauth_dcr_enabled`.
+fn default_true() -> bool {
+    true
 }
 
 /// Per-project config: .gosh-memory.toml
@@ -176,5 +238,63 @@ mod tests {
 
         std::fs::write(tmp.path().join(".gosh-memory.toml"), "key = \"test-project\"\n").unwrap();
         assert_eq!(find_project_key(tmp.path()), Some("test-project".to_string()));
+    }
+
+    /// `gosh-agent serve` re-reads `GlobalConfig` on every startup
+    /// (fresh launch, daemon respawn after a crash, autostart on
+    /// boot, `gosh agent restart`), so the flag the operator set
+    /// with `gosh agent setup --no-oauth-dcr` must round-trip
+    /// through TOML untouched. A regression in `#[serde(default
+    /// = "default_true")]` or in the manual `Serialize` would
+    /// silently re-enable DCR on the next daemon restart — exactly
+    /// the kind of change that's painless to merge and impossible
+    /// to spot in production logs.
+    #[test]
+    fn oauth_dcr_disabled_round_trips_through_save_and_load() {
+        let cfg = GlobalConfig {
+            authority_url: "http://127.0.0.1:8765".to_string(),
+            token: None,
+            principal_auth_token: None,
+            install_id: "test".to_string(),
+            key: None,
+            swarm_id: None,
+            host: None,
+            port: None,
+            watch: false,
+            watch_key: None,
+            watch_swarm_id: None,
+            watch_agent_id: None,
+            watch_context_key: None,
+            watch_budget: None,
+            poll_interval: None,
+            oauth_dcr_enabled: false,
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let loaded: GlobalConfig = toml::from_str(&text).unwrap();
+        assert!(
+            !loaded.oauth_dcr_enabled,
+            "oauth_dcr_enabled=false must survive save+load — daemon \
+             restart re-reads GlobalConfig and mustn't silently flip \
+             DCR back on. Got config TOML:\n{text}",
+        );
+    }
+
+    #[test]
+    fn legacy_global_config_without_oauth_dcr_field_defaults_to_enabled() {
+        // Older config files (pre-7a) didn't carry `oauth_dcr_enabled`
+        // at all. Loading one of those into the post-7a struct must
+        // default to DCR ON — the spec's UX-default. A bare
+        // `#[serde(default)]` would default to `false` and silently
+        // disable DCR on every legacy install; pin the helper.
+        let legacy = r#"
+            authority_url = "http://127.0.0.1:8765"
+            install_id = "x"
+        "#;
+        let parsed: GlobalConfig = toml::from_str(legacy).unwrap();
+        assert!(
+            parsed.oauth_dcr_enabled,
+            "missing oauth_dcr_enabled in legacy TOML must default to true \
+             (DCR on) — this is the helper-function regression guard"
+        );
     }
 }

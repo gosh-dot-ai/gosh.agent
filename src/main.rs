@@ -7,7 +7,9 @@ mod client;
 mod courier;
 mod crypto;
 mod join;
+mod keychain;
 mod llm;
+mod oauth;
 mod plugin;
 mod sandbox;
 mod server;
@@ -26,7 +28,6 @@ use anyhow::bail;
 use anyhow::Context;
 use clap::Parser;
 use clap::Subcommand;
-use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -42,7 +43,11 @@ use crate::server::AppState;
 use crate::watcher::WatchConfig;
 
 #[derive(Parser)]
-#[command(name = "gosh-agent", about = "GOSH AI Agent — MCP server, capture plugin, MCP proxy")]
+#[command(
+    name = "gosh-agent",
+    about = "GOSH AI Agent — MCP server, capture plugin, MCP proxy",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -51,12 +56,19 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
-    /// Run as MCP server (default agent mode)
+    /// Run as MCP server (default agent mode).
+    ///
+    /// Reads configuration from `~/.gosh/agent/state/<name>/config.toml`
+    /// (the `GlobalConfig` written by `gosh-agent setup`). Every flag
+    /// below is optional and overrides the corresponding config value
+    /// when present — `gosh agent start` invokes this with just `--name`,
+    /// the rest is for dev iteration and ad-hoc debugging.
     Serve {
-        /// JSON file with join_token + secret_key (base64), deleted by CLI
-        /// after start
+        /// Agent instance name. Drives both the GlobalConfig load
+        /// (`~/.gosh/agent/state/<name>/config.toml`) and the keychain
+        /// lookup (service "gosh", account "agent/<name>"). Required.
         #[arg(long)]
-        bootstrap_file: Option<String>,
+        name: String,
         #[arg(long)]
         join: Option<String>,
         #[arg(long)]
@@ -69,24 +81,31 @@ enum Command {
         memory_auth_token: Option<String>,
         #[arg(long, env = "GOSH_AGENT_MEMORY_PRINCIPAL_ID")]
         memory_principal_id: Option<String>,
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long, default_value = "8767")]
-        port: u16,
+        /// Override `GlobalConfig.host`. Falls back to `127.0.0.1`.
         #[arg(long)]
+        host: Option<String>,
+        /// Override `GlobalConfig.port`. Falls back to `8767`.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Force the watcher loop on. Mutually exclusive with `--no-watch`.
+        /// Without either flag, falls back to `GlobalConfig.watch`.
+        #[arg(long, conflicts_with = "no_watch")]
         watch: bool,
-        #[arg(long, default_value = "default")]
-        watch_key: String,
+        /// Force the watcher loop off. Mutually exclusive with `--watch`.
+        #[arg(long, conflicts_with = "watch")]
+        no_watch: bool,
+        #[arg(long)]
+        watch_key: Option<String>,
         #[arg(long = "watch-context-key")]
         watch_context_key: Option<String>,
-        #[arg(long, default_value = "default")]
-        watch_agent_id: String,
-        #[arg(long, default_value = "default")]
-        watch_swarm_id: String,
-        #[arg(long, default_value = "30")]
-        poll_interval: u64,
-        #[arg(long, default_value = "10.0")]
-        watch_budget: f64,
+        #[arg(long)]
+        watch_agent_id: Option<String>,
+        #[arg(long)]
+        watch_swarm_id: Option<String>,
+        #[arg(long)]
+        poll_interval: Option<u64>,
+        #[arg(long)]
+        watch_budget: Option<f64>,
     },
     /// Capture prompt or response from a coding CLI hook
     Capture {
@@ -98,19 +117,40 @@ enum Command {
         #[arg(long)]
         event: String,
     },
-    /// Run as MCP proxy (stdio), injecting auth and forwarding to authority
+    /// Run as MCP proxy (stdio): a thin transport bridge between the
+    /// coding-CLI process and the agent daemon's HTTP `/mcp`. The daemon
+    /// owns the memory MCP relay, key/swarm scoping, tools/list filtering,
+    /// and tool-name allowlist; this binary just forwards JSON-RPC.
     McpProxy {
-        /// Agent instance name
+        /// Agent instance name (used for log identification only — the
+        /// daemon reads its own per-instance config).
         #[arg(long)]
         name: String,
+        /// Daemon host. When absent, the proxy reads the bind host
+        /// from the per-instance `GlobalConfig` for `--name` and
+        /// rewrites bind placeholders (`0.0.0.0` / `::`) to loopback.
+        /// Pass explicitly only when the proxy and daemon run in
+        /// different network namespaces.
         #[arg(long)]
+        daemon_host: Option<String>,
+        /// Daemon port. When absent, the proxy reads it from the
+        /// per-instance `GlobalConfig` for `--name`. Pass explicitly
+        /// only to override (rare — `gosh-agent setup` writes the
+        /// configured port back into the generated MCP args, so a
+        /// freshly-`setup`-ped instance never needs an override).
+        #[arg(long)]
+        daemon_port: Option<u16>,
+        /// Deprecated, kept for backwards compatibility with `.mcp.json`
+        /// files written by older `gosh-agent setup` runs. The daemon now
+        /// applies key injection itself based on the per-instance
+        /// `GlobalConfig`. The proxy ignores any value passed here.
+        #[arg(long, hide = true)]
         default_key: Option<String>,
-        /// Swarm ID injected into all memory tool calls (e.g., memory_recall,
-        /// memory_store). Without this, calls default to swarm_id="default" on
-        /// the server, missing facts written under a named swarm.
-        #[arg(long)]
+        /// Deprecated. See `--default-key` — same story for swarm scope.
+        #[arg(long, hide = true)]
         default_swarm: Option<String>,
-        #[arg(long, default_value_t = false)]
+        /// Deprecated. The daemon owns the tools/list filter now.
+        #[arg(long, hide = true, default_value_t = false)]
         full_memory_surface: bool,
     },
     /// Detect CLIs, write configs, register hooks
@@ -155,6 +195,85 @@ enum Command {
         /// codex MCP.
         #[arg(long, default_value = "project", value_parser = ["project", "user"])]
         scope: String,
+
+        // ── Daemon-spawn config (canonical source of truth) ─────────────
+        //
+        // After the MCP unification work
+        // (<gosh.cli>/specs/agent_mcp_unification.md) `gosh agent setup`
+        // is the single place where agent-instance settings live. The
+        // daemon and the autostart artifact (launchd / systemd) read all
+        // of these from `GlobalConfig` at startup; `gosh agent start` and
+        // `gosh agent stop` are pure process-lifecycle and don't take
+        // these flags themselves. Re-running setup with a subset of flags
+        // patches just those (semantics documented per-flag).
+        /// Daemon HTTP bind host. Defaults to `127.0.0.1` when unset.
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Daemon HTTP bind port. Defaults to `8767` when unset.
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Enable the watcher loop. Mutually exclusive with `--no-watch`.
+        #[arg(long, conflicts_with = "no_watch")]
+        watch: bool,
+
+        /// Disable the watcher loop. Mutually exclusive with `--watch`.
+        #[arg(long, conflicts_with = "watch")]
+        no_watch: bool,
+
+        /// Namespace key the watcher subscribes to for task discovery.
+        #[arg(long)]
+        watch_key: Option<String>,
+
+        /// Swarm filter for the watcher's courier subscription.
+        #[arg(long)]
+        watch_swarm_id: Option<String>,
+
+        /// Agent-id filter for the watcher (default: derived from
+        /// principal_id).
+        #[arg(long)]
+        watch_agent_id: Option<String>,
+
+        /// Context retrieval namespace, distinct from `--watch-key` when an
+        /// agent watches one namespace and recalls context from another.
+        #[arg(long)]
+        watch_context_key: Option<String>,
+
+        /// USD budget cap for autonomous task execution.
+        #[arg(long)]
+        watch_budget: Option<f64>,
+
+        /// Polling interval (seconds) for the watcher loop fallback when
+        /// courier SSE is unavailable.
+        #[arg(long)]
+        poll_interval: Option<u64>,
+
+        /// Disable Dynamic Client Registration on the daemon's
+        /// `/oauth/register` endpoint. By default the daemon accepts
+        /// unauthenticated DCR per RFC 7591 (the standard MCP-spec
+        /// path); pass `--no-oauth-dcr` to require explicit
+        /// per-client registration via `gosh agent oauth clients
+        /// register --name <X>` instead.
+        ///
+        /// Same shape as `--no-autostart`: setup declares the
+        /// desired state on every run. Absence ⇒ DCR on, presence ⇒
+        /// DCR off. Re-running without the flag re-enables DCR.
+        #[arg(long)]
+        no_oauth_dcr: bool,
+
+        /// Skip writing the launchd / systemd autostart artifact. The
+        /// operator supervises the daemon themselves (docker-compose,
+        /// runit, supervisord, etc.).
+        #[arg(long)]
+        no_autostart: bool,
+    },
+    /// Tear down an agent instance: stop the daemon, remove autostart
+    /// artifact, hooks/MCP entries, and per-instance state.
+    Uninstall {
+        /// Agent instance name.
+        #[arg(long)]
+        name: String,
     },
     /// Replay buffered writes to authority
     ReplayBuffer {
@@ -177,29 +296,81 @@ async fn main() -> anyhow::Result<()> {
             init_plugin_tracing();
             plugin::capture::run(&name, &platform, &event).await
         }
-        Command::McpProxy { name, default_key, default_swarm, full_memory_surface } => {
+        Command::McpProxy {
+            name,
+            daemon_host,
+            daemon_port,
+            default_key: _,
+            default_swarm: _,
+            full_memory_surface: _,
+        } => {
             init_plugin_tracing();
-            plugin::proxy::run(
-                &name,
-                default_key.as_deref(),
-                default_swarm.as_deref(),
-                full_memory_surface,
-            )
+            plugin::proxy::run(&name, daemon_host.as_deref(), daemon_port).await
+        }
+        Command::Setup {
+            name,
+            authority,
+            token,
+            auth_token,
+            key,
+            swarm,
+            platform,
+            scope,
+            host,
+            port,
+            watch,
+            no_watch,
+            watch_key,
+            watch_swarm_id,
+            watch_agent_id,
+            watch_context_key,
+            watch_budget,
+            poll_interval,
+            no_oauth_dcr,
+            no_autostart,
+        } => {
+            init_plugin_tracing();
+            // Three-state mapping: explicit `--watch` → Some(true),
+            // explicit `--no-watch` → Some(false), neither → None
+            // (preserve existing config). clap enforces mutual exclusion.
+            let watch_arg = if watch {
+                Some(true)
+            } else if no_watch {
+                Some(false)
+            } else {
+                None
+            };
+            // Two-state for DCR (matches `--no-autostart` style):
+            // absence ⇒ DCR on, presence ⇒ DCR off. Always
+            // overwrites GlobalConfig — re-running setup without
+            // `--no-oauth-dcr` re-enables DCR by design.
+            let oauth_dcr_arg = !no_oauth_dcr;
+            plugin::setup::run(plugin::setup::SetupArgs {
+                agent_name: &name,
+                authority_url: authority.as_deref(),
+                token: token.as_deref(),
+                principal_auth_token: auth_token.as_deref(),
+                key: key.as_deref(),
+                swarm_id: swarm.as_deref(),
+                platforms: &platform,
+                scope: &scope,
+                host: host.as_deref(),
+                port,
+                watch: watch_arg,
+                watch_key: watch_key.as_deref(),
+                watch_swarm_id: watch_swarm_id.as_deref(),
+                watch_agent_id: watch_agent_id.as_deref(),
+                watch_context_key: watch_context_key.as_deref(),
+                watch_budget,
+                poll_interval,
+                oauth_dcr_enabled: oauth_dcr_arg,
+                no_autostart,
+            })
             .await
         }
-        Command::Setup { name, authority, token, auth_token, key, swarm, platform, scope } => {
+        Command::Uninstall { name } => {
             init_plugin_tracing();
-            plugin::setup::run(
-                &name,
-                authority.as_deref(),
-                token.as_deref(),
-                auth_token.as_deref(),
-                key.as_deref(),
-                swarm.as_deref(),
-                &platform,
-                &scope,
-            )
-            .await
+            plugin::uninstall::run(&name).await
         }
         Command::ReplayBuffer { name } => {
             init_plugin_tracing();
@@ -226,70 +397,120 @@ fn init_plugin_tracing() {
         .init();
 }
 
-/// Contents of the bootstrap file written by CLI and deleted after agent start.
-#[derive(Deserialize)]
-struct BootstrapData {
-    join_token: String,
-    /// Base64-encoded 32-byte X25519 private key.
-    secret_key: String,
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn serve(cmd: Command) -> anyhow::Result<()> {
     let Command::Serve {
-        bootstrap_file,
+        name,
         join,
         allow_insecure_inline_join,
         memory_url,
         memory_token,
         memory_auth_token,
         memory_principal_id,
-        host,
-        port,
-        watch,
-        watch_key,
-        watch_context_key,
-        watch_agent_id,
-        watch_swarm_id,
-        poll_interval,
-        watch_budget,
+        host: host_arg,
+        port: port_arg,
+        watch: watch_flag,
+        no_watch: no_watch_flag,
+        watch_key: watch_key_arg,
+        watch_context_key: watch_context_key_arg,
+        watch_agent_id: watch_agent_id_arg,
+        watch_swarm_id: watch_swarm_id_arg,
+        poll_interval: poll_interval_arg,
+        watch_budget: watch_budget_arg,
     } = cmd
     else {
         unreachable!()
     };
 
-    // Parse bootstrap file (contains join_token + secret_key), then delete it
-    // to prevent secret key material from lingering on disk.
-    let bootstrap: Option<BootstrapData> = match bootstrap_file {
-        Some(ref path) => {
-            let content = std::fs::read_to_string(path)
-                .with_context(|| format!("reading bootstrap file: {path}"))?;
-            let data = serde_json::from_str(&content).context("parsing bootstrap file")?;
-            if let Err(e) = std::fs::remove_file(path) {
-                tracing::warn!("failed to delete bootstrap file {path}: {e}");
-            }
-            Some(data)
+    // Load MCP-forwarding defaults and credentials from the per-instance
+    // state the CLI provisioned. The CLI is the canonical writer (during
+    // `gosh agent create` / `gosh agent import` / `gosh agent setup`); the
+    // daemon is read-only.
+    //
+    // `key` / `swarm_id` come from `GlobalConfig` (the agent's bound scope —
+    // distinct from `--watch-key` / `--watch-swarm-id`, which subscribe the
+    // watcher loop to a task-discovery namespace; agents legitimately watch
+    // one namespace and forward MCP calls in another).
+    //
+    // `principal_token` / `join_token` / `secret_key` come from the OS
+    // keychain entry the CLI wrote at provisioning time. There is no
+    // bootstrap-file path anymore — the daemon used to receive an ephemeral
+    // file from the CLI on each spawn, but with the daemon now able to
+    // read keychain directly that intermediate channel is unnecessary
+    // (and its existence forced the CLI into a write-temp-secret /
+    // delete dance that was its own attack surface).
+    let global_config = plugin::config::GlobalConfig::load(&name).with_context(|| {
+        format!(
+            "could not load per-instance config for agent '{name}' \
+             (~/.gosh/agent/state/{name}/config.toml). Run `gosh agent setup --instance {name}` \
+             to provision it"
+        )
+    })?;
+    let forwarding_default_key = global_config.key.clone().filter(|s| !s.is_empty());
+    let forwarding_default_swarm_id = global_config.swarm_id.clone().filter(|s| !s.is_empty());
+
+    // CLI flags override the corresponding `GlobalConfig` value; in their
+    // absence we fall back to config, then to baked-in defaults. Setup is
+    // the canonical writer, so the common case is "no flags, all values
+    // from config".
+    let host =
+        host_arg.or_else(|| global_config.host.clone()).unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = port_arg.or(global_config.port).unwrap_or(8767);
+    let watch = if watch_flag {
+        true
+    } else if no_watch_flag {
+        false
+    } else {
+        global_config.watch
+    };
+    let watch_key = watch_key_arg
+        .or_else(|| global_config.watch_key.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let watch_context_key =
+        watch_context_key_arg.or_else(|| global_config.watch_context_key.clone());
+    let watch_agent_id = watch_agent_id_arg
+        .or_else(|| global_config.watch_agent_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let watch_swarm_id = watch_swarm_id_arg
+        .or_else(|| global_config.watch_swarm_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let poll_interval = poll_interval_arg.or(global_config.poll_interval).unwrap_or(30);
+    let watch_budget = watch_budget_arg.or(global_config.watch_budget).unwrap_or(10.0);
+
+    let agent_secrets = keychain::AgentSecrets::load(&name)
+        .with_context(|| format!("could not read keychain for agent '{name}'"))?
+        .with_context(|| {
+            format!(
+                "no keychain entry found for agent '{name}'. \
+                 Run `gosh agent create --instance {name}` or \
+                 `gosh agent import` to provision credentials"
+            )
+        })?;
+
+    let join_from_keychain = agent_secrets.join_token.clone();
+    let secret_key_bytes = match agent_secrets.secret_key.as_deref() {
+        Some(b64) => {
+            use base64::Engine;
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .context("decoding secret_key from keychain")?,
+            )
         }
         None => None,
     };
-    let join_from_bootstrap = bootstrap.as_ref().map(|b| b.join_token.clone());
-    let secret_key_bytes = bootstrap
-        .as_ref()
-        .map(|b| {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(&b.secret_key)
-                .context("decoding secret_key from bootstrap file")
-        })
-        .transpose()?;
 
-    let effective_join = join.as_deref().or(join_from_bootstrap.as_deref());
+    let effective_join = join.as_deref().or(join_from_keychain.as_deref());
+    // CLI/env-provided memory auth token wins; otherwise fall back to the
+    // keychain-stored agent principal token (the one the CLI provisioned at
+    // create/import time).
+    let effective_memory_auth = memory_auth_token.or_else(|| agent_secrets.principal_token.clone());
     let resolved_memory = resolve_memory_connection(
         effective_join,
         allow_insecure_inline_join,
         memory_url.as_deref(),
         memory_token,
-        memory_auth_token,
+        effective_memory_auth,
         memory_principal_id,
     )?;
     let mem_url = resolved_memory.memory_url.clone();
@@ -312,7 +533,7 @@ async fn serve(cmd: Command) -> anyhow::Result<()> {
     let secret_ctx = match secret_key_bytes {
         Some(bytes) => {
             if bytes.len() != 32 {
-                bail!("secret_key in bootstrap file must be exactly 32 bytes, got {}", bytes.len());
+                bail!("secret_key from keychain must be exactly 32 bytes, got {}", bytes.len());
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
@@ -324,7 +545,10 @@ async fn serve(cmd: Command) -> anyhow::Result<()> {
                 http: reqwest::Client::new(),
             })
         }
-        None => bail!("--bootstrap-file is required (contains join_token and secret_key)"),
+        None => bail!(
+            "no `secret_key` found in keychain for agent '{name}'. \
+             Run `gosh agent create --instance {name}` or `gosh agent import` to provision it"
+        ),
     };
 
     let agent = Agent::with_pricing(config.clone(), memory.clone(), secret_ctx, pricing);
@@ -337,17 +561,75 @@ async fn serve(cmd: Command) -> anyhow::Result<()> {
         .unwrap_or("default")
         .to_string();
 
+    // OAuth surface: load the persistent client store and mint a
+    // fresh per-process admin token written to the state dir for
+    // the CLI to find. Failures here are non-fatal — daemon still
+    // serves /mcp and /health, but `/admin/*` and `/oauth/*` will
+    // refuse callers (admin token mismatch / lock contention).
+    let oauth_clients_store = oauth::clients::ClientStore::load(&name)
+        .with_context(|| format!("loading OAuth client store for agent '{name}'"))?;
+    let admin_token = oauth::admin_token::write_fresh_token(&name)
+        .with_context(|| format!("provisioning admin token for agent '{name}'"))?;
+    let oauth_sessions_store = oauth::sessions::SessionStore::new();
+    let oauth_tokens_store = oauth::tokens::TokenStore::load(&name)
+        .with_context(|| format!("loading OAuth token store for agent '{name}'"))?;
+
     let app_state = Arc::new(AppState {
         agent,
         memory: memory.clone(),
         courier: Mutex::new(CourierListener::new(&mem_url, mem_token, pinned_client)),
         agent_id,
         default_context_key: watch_context_key.clone(),
+        default_key: forwarding_default_key,
+        default_swarm_id: forwarding_default_swarm_id,
         session_counter: Mutex::new(0),
         dispatched_tasks: Mutex::new(server::DispatchedTracker::default()),
         in_flight_tasks: Mutex::new(HashSet::new()),
         in_flight_by_agent: Mutex::new(HashMap::new()),
+        oauth_dcr_enabled: global_config.oauth_dcr_enabled,
+        oauth_clients: Mutex::new(oauth_clients_store),
+        oauth_sessions: Mutex::new(oauth_sessions_store),
+        oauth_tokens: Mutex::new(oauth_tokens_store),
+        admin_token,
     });
+
+    // Background sweep: every 60s, evict expired `/oauth/authorize`
+    // sessions. The TTL is 10 minutes so a slower interval is fine —
+    // we just don't want stale entries piling up indefinitely under
+    // a noisy traffic pattern. Failures (mutex poisoning, etc.)
+    // would log via tracing; the daemon keeps running.
+    {
+        let sweeper_state = app_state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                let removed = sweeper_state.oauth_sessions.lock().await.sweep();
+                if removed > 0 {
+                    tracing::debug!(removed, "oauth: swept expired authorize sessions");
+                }
+            }
+        });
+    }
+
+    // Background sweep for expired access tokens. Refresh tokens
+    // have no TTL — they live until explicitly revoked or the
+    // backing client is removed — so this only touches in-memory
+    // access state. Same 60s cadence as the session sweep; access
+    // TTL is 1h so a few extra seconds of dead state is fine.
+    {
+        let sweeper_state = app_state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                let removed = sweeper_state.oauth_tokens.lock().await.sweep_access();
+                if removed > 0 {
+                    tracing::debug!(removed, "oauth: swept expired access tokens");
+                }
+            }
+        });
+    }
 
     sandbox::apply_agent_sandbox();
 
@@ -361,6 +643,24 @@ async fn serve(cmd: Command) -> anyhow::Result<()> {
     println!("  Watch mode:  {}", if watch { "ON" } else { "off" });
     println!("  POST /mcp    → agent_start, agent_status");
     println!("  GET  /health → health check");
+
+    // Surface non-loopback binds prominently — operator should know
+    // the daemon is exposed beyond the host. The Bearer middleware on
+    // `/mcp` plus the OAuth surface mean the wire is gated even
+    // without TLS, but the daemon itself does NOT terminate TLS:
+    // anything more than a curl-driven smoke test needs a TLS
+    // terminator (Caddy / cloudflared / Tailscale Funnel). See the
+    // operator runbook in `<gosh.cli>/docs/cli.md`.
+    let bind_is_public =
+        !host.starts_with("127.") && host != "localhost" && host != "::1" && host != "[::1]";
+    if bind_is_public {
+        println!();
+        println!("  ⚠  Daemon is binding to a NON-LOOPBACK address ({host}).");
+        println!("     The OAuth + Bearer surface protects /mcp, but the daemon");
+        println!("     does NOT terminate TLS. Put Caddy / cloudflared / Tailscale");
+        println!("     Funnel in front before pointing Claude.ai at this URL.");
+        println!("     Runbook: <gosh.cli>/docs/cli.md#exposing-the-agent-to-the-internet");
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
@@ -391,11 +691,19 @@ async fn serve(cmd: Command) -> anyhow::Result<()> {
 
         info!("watch mode started");
 
-        let result = axum::serve(listener, app).await;
+        // `into_make_service_with_connect_info` is what makes
+        // `ConnectInfo<SocketAddr>` available to the admin
+        // middleware so it can enforce loopback-only access.
+        let result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
         let _ = cancel_tx.send(true);
         result?;
     } else {
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await?;
     }
 
     Ok(())
@@ -423,7 +731,8 @@ fn resolve_memory_connection(
     let mut state = if let Some(token) = join {
         if !allow_insecure_inline_join && !token.starts_with("gosh_join_") {
             bail!(
-                "--join is insecure for raw tokens; use --bootstrap-file or add --allow-insecure-inline-join"
+                "--join is insecure for raw tokens; rely on the keychain-provisioned join_token \
+                 (CLI handles this) or add --allow-insecure-inline-join"
             );
         }
         let decoded = join::JoinToken::decode(token)?;

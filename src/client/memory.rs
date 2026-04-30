@@ -172,4 +172,26 @@ impl MemoryMcpClient {
     pub async fn courier_unsubscribe(&self, sub_id: &str) -> Result<Value> {
         self.client.call_tool("courier_unsubscribe", json!({ "sub_id": sub_id })).await
     }
+
+    /// Forward a tool call to memory by name without a typed wrapper.
+    ///
+    /// Used by the daemon's `/mcp` HTTP gateway when it relays a
+    /// `memory_*` call from a coding-CLI LLM (or any remote client)
+    /// onto memory itself. Caller is responsible for any per-call
+    /// scoping (key/swarm injection) before invoking — see
+    /// `client::memory_inject::set_default_key_if_absent` and friends.
+    /// Errors surface as `Err` per the underlying `McpClient::call_tool`
+    /// semantics: JSON-RPC-level errors and tool-level `isError=true`
+    /// both bail with a human-readable message.
+    pub async fn forward_tool(&self, tool_name: &str, args: Value) -> Result<Value> {
+        self.client.call_tool(tool_name, args).await
+    }
+
+    /// Query memory's `tools/list` so the daemon can build its merged
+    /// surface (memory tools + the daemon's own `agent_*` tools).
+    /// Returns memory's raw `result` shape (`{ "tools": [ ... ] }`);
+    /// caller filters and augments.
+    pub async fn list_tools(&self) -> Result<Value> {
+        self.client.list_tools().await
+    }
 }

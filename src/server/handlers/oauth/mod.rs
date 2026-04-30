@@ -1,8 +1,8 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
 // SPDX-License-Identifier: MIT
 
-pub mod admin;
-pub mod health;
-pub mod mcp;
-pub mod mcp_auth;
-pub mod oauth;
+pub mod authorize;
+pub mod metadata;
+pub mod register;
+pub mod revoke;
+pub mod token;

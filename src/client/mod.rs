@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 pub mod memory;
+pub mod memory_inject;
 pub mod secrets;
 pub mod transport;
 
@@ -35,7 +36,7 @@ impl McpClient {
             "params": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {},
-                "clientInfo": { "name": &self.client_name, "version": "0.1.0" }
+                "clientInfo": { "name": &self.client_name, "version": env!("CARGO_PKG_VERSION") }
             }
         });
 
@@ -54,6 +55,24 @@ impl McpClient {
         let _ = self.transport.send(&notify, Some(&session_id)).await;
 
         Ok(session_id)
+    }
+
+    /// Query the upstream MCP server for its `tools/list`. Returns the
+    /// `result` field of the JSON-RPC response, which is normally
+    /// `{ "tools": [ ... ] }`. Errors at the JSON-RPC envelope level
+    /// bail; the caller handles the inner shape.
+    pub async fn list_tools(&self) -> Result<Value> {
+        let session_id = self.initialize().await?;
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        });
+        let (response, _) = self.transport.send(&body, Some(&session_id)).await?;
+        if let Some(error) = response.get("error") {
+            bail!("MCP tools/list error: {error}");
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
     pub async fn call_tool(&self, tool_name: &str, args: Value) -> Result<Value> {

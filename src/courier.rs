@@ -15,6 +15,7 @@ use tracing::warn;
 
 use crate::client::memory::CourierSubscribeParams;
 use crate::client::memory::MemoryMcpClient;
+use crate::client::transport::canonical_mcp_url;
 use crate::server::AppState;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -61,7 +62,13 @@ impl CourierListener {
             anyhow::bail!("already subscribed");
         }
 
-        let sse_url = format!("{}/mcp/sse", self.memory_url);
+        // `memory_url` may legitimately come in as bare host, with a
+        // trailing slash, or already including `/mcp` (per the same
+        // GlobalConfig.authority_url accepted by HttpTransport and the
+        // stdio mcp-proxy). Build the SSE endpoint off the canonical
+        // `<base>/mcp` form so a config that already includes `/mcp`
+        // doesn't double up into `/mcp/mcp/sse`.
+        let sse_url = format!("{}/sse", canonical_mcp_url(&self.memory_url));
         let agent_target = format!("agent:{agent_id}");
         let filter = json!({"kind": "task", "target": agent_target});
 

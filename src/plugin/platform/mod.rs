@@ -49,7 +49,7 @@ pub(super) const TRANSCRIPT_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(
 /// that happens, the first read returns no assistant text, capture's
 /// empty-content guard skips `memory_write`, and a real assistant turn
 /// is silently lost. (Symptom seen for short single-token replies in
-/// gosh-ai-agent v0.5.1; see CHANGELOG.)
+/// <gosh.agent> v0.5.1; see CHANGELOG.)
 ///
 /// `read` is the per-platform transcript parser (e.g. `diff_transcript`).
 /// It stays synchronous — `std::fs::read` underneath. We only need

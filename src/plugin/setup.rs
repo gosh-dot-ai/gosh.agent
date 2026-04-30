@@ -12,18 +12,70 @@ use super::config::GlobalConfig;
 
 const VALID_PLATFORMS: &[&str] = &["claude", "codex", "gemini"];
 
+/// All arguments to `gosh-agent setup`. Setup is a single-source-of-truth
+/// configuration step: every field below either updates the corresponding
+/// `GlobalConfig` value (when present) or leaves the existing value
+/// untouched (when `None` / `false`). Re-running setup with a subset of
+/// flags patches just those, so users iterate by re-running setup, not by
+/// passing config flags to `gosh agent start` (which is now purely
+/// process-lifecycle).
+pub struct SetupArgs<'a> {
+    pub agent_name: &'a str,
+    pub authority_url: Option<&'a str>,
+    pub token: Option<&'a str>,
+    pub principal_auth_token: Option<&'a str>,
+    pub key: Option<&'a str>,
+    pub swarm_id: Option<&'a str>,
+    pub platforms: &'a [String],
+    pub scope: &'a str,
+    /// Daemon HTTP bind. `None` keeps existing or falls back to `127.0.0.1`.
+    pub host: Option<&'a str>,
+    /// Daemon HTTP bind port. `None` keeps existing or falls back to `8767`.
+    pub port: Option<u16>,
+    /// Whether to enable the watcher loop. `None` keeps existing value.
+    pub watch: Option<bool>,
+    pub watch_key: Option<&'a str>,
+    pub watch_swarm_id: Option<&'a str>,
+    pub watch_agent_id: Option<&'a str>,
+    pub watch_context_key: Option<&'a str>,
+    pub watch_budget: Option<f64>,
+    pub poll_interval: Option<u64>,
+    /// Desired state of the daemon's OAuth `/oauth/register` endpoint
+    /// (RFC 7591 Dynamic Client Registration). Setup declares this
+    /// state on every run — same shape as `no_autostart`. Always
+    /// overwrites `GlobalConfig.oauth_dcr_enabled`; the CLI maps its
+    /// `--no-oauth-dcr` flag (presence) to `false`, absence to `true`.
+    pub oauth_dcr_enabled: bool,
+    /// Skip writing the launchd / systemd autostart artifact. The user
+    /// supervises the daemon themselves (docker-compose, runit,
+    /// supervisord, etc.). Default `false` — autostart is the expected
+    /// always-on path.
+    pub no_autostart: bool,
+}
+
 /// Run `gosh-agent setup`.
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    agent_name: &str,
-    authority_url: Option<&str>,
-    token: Option<&str>,
-    principal_auth_token: Option<&str>,
-    key: Option<&str>,
-    swarm_id: Option<&str>,
-    platforms: &[String],
-    scope: &str,
-) -> Result<()> {
+pub async fn run(args: SetupArgs<'_>) -> Result<()> {
+    let SetupArgs {
+        agent_name,
+        authority_url,
+        token,
+        principal_auth_token,
+        key,
+        swarm_id,
+        platforms,
+        scope,
+        host,
+        port,
+        watch,
+        watch_key,
+        watch_swarm_id,
+        watch_agent_id,
+        watch_context_key,
+        watch_budget,
+        poll_interval,
+        oauth_dcr_enabled,
+        no_autostart,
+    } = args;
     // Validate --platform values
     for p in platforms {
         if !VALID_PLATFORMS.contains(&p.as_str()) {
@@ -63,6 +115,16 @@ pub async fn run(
         principal_auth_token,
         &project_key,
         swarm_id,
+        host,
+        port,
+        watch,
+        watch_key,
+        watch_swarm_id,
+        watch_agent_id,
+        watch_context_key,
+        watch_budget,
+        poll_interval,
+        oauth_dcr_enabled,
     )?;
     eprintln!("Config written to {}", GlobalConfig::path(agent_name).display());
 
@@ -95,46 +157,151 @@ pub async fn run(
         return Ok(());
     }
 
+    // Effective daemon endpoint that the proxy invocations should
+    // dial. `global_config` was just written above, so its host/port
+    // are the values the daemon itself will bind to on next start —
+    // the same values must be baked into the generated MCP configs
+    // so a coding-CLI on this host reaches *this* agent's daemon
+    // (and not another agent listening on the default 8767 port,
+    // which would silently bypass Bearer via direct-loopback
+    // routing into the wrong namespace).
+    let daemon_host = global_config.host.as_deref().unwrap_or("127.0.0.1");
+    let daemon_port = global_config.port.unwrap_or(8767);
+
+    // Decide whether the per-CLI MCP configs are even safe to write.
+    // The stdio mcp-proxy is bearerless and depends on /mcp's
+    // direct-loopback bypass — if the daemon is bound to a concrete
+    // non-loopback interface (e.g. `--host 192.168.1.50`), the proxy
+    // can't reach loopback (no listener there) and dialling the
+    // concrete IP fails the bypass + has no Bearer to fall back on,
+    // so every coding-CLI tool call would 401. Writing the config
+    // anyway just guarantees a 401 storm in the operator's logs.
+    // Found in the post-v0.8.0+1 review.
+    let local_mcp_compatible = super::net::is_local_mcp_compatible_bind(daemon_host);
+    if !local_mcp_compatible {
+        eprintln!(
+            "Skipping local MCP config for coding CLIs: daemon is bound to '{daemon_host}', \
+             which the bearerless stdio mcp-proxy cannot reach via loopback. Hooks are still \
+             installed (capture works regardless of MCP wiring). To enable local MCP for \
+             Claude / Codex / Gemini on this host, re-run setup with `--host 0.0.0.0` (binds \
+             every interface, including loopback) or `--host 127.0.0.1`. Remote MCP through \
+             the OAuth-gated `/mcp` endpoint is unaffected."
+        );
+    }
+
     for cli_name in &detected {
         match cli_name.as_str() {
             "claude" => {
                 configure_claude_hooks(agent_name, &binary_path, scope, &cwd)?;
-                configure_claude_mcp(
-                    agent_name,
-                    &cwd,
-                    &project_key,
-                    swarm_id,
-                    scope,
-                    &binary_path,
-                )?;
-                eprintln!("Configured Claude Code hooks + MCP (scope: {scope})");
+                if local_mcp_compatible {
+                    configure_claude_mcp(
+                        agent_name,
+                        &cwd,
+                        &project_key,
+                        swarm_id,
+                        scope,
+                        &binary_path,
+                        daemon_host,
+                        daemon_port,
+                    )?;
+                    eprintln!("Configured Claude Code hooks + MCP (scope: {scope})");
+                } else {
+                    // Re-running setup with an incompatible bind on an
+                    // instance that previously *had* a working MCP entry
+                    // (e.g. operator re-binds a 0.0.0.0 daemon to a
+                    // single-interface IP) must also strip the now-stale
+                    // entry — otherwise Claude keeps dialling the
+                    // recorded loopback target until the operator
+                    // notices and edits `.mcp.json` by hand. Idempotent
+                    // when no prior entry exists.
+                    remove_claude_mcp(agent_name, &cwd)?;
+                    eprintln!(
+                        "Configured Claude Code hooks (scope: {scope}); \
+                         MCP skipped + any prior MCP entry for `{agent_name}` removed \
+                         (see warning above)"
+                    );
+                }
             }
             "codex" => {
                 configure_codex_hooks(agent_name, &binary_path, scope, &cwd)?;
-                configure_codex_mcp(agent_name, &cwd, &project_key, swarm_id, &binary_path)?;
-                if scope == "project" {
-                    eprintln!(
-                        "Configured Codex CLI hooks (scope: project) + MCP (scope: user — \
-                         `codex mcp add` has no per-project mode upstream)"
-                    );
+                if local_mcp_compatible {
+                    configure_codex_mcp(
+                        agent_name,
+                        &cwd,
+                        &project_key,
+                        swarm_id,
+                        &binary_path,
+                        daemon_host,
+                        daemon_port,
+                    )?;
+                    if scope == "project" {
+                        eprintln!(
+                            "Configured Codex CLI hooks (scope: project) + MCP (scope: user — \
+                             `codex mcp add` has no per-project mode upstream)"
+                        );
+                    } else {
+                        eprintln!("Configured Codex CLI hooks + MCP (scope: {scope})");
+                    }
                 } else {
-                    eprintln!("Configured Codex CLI hooks + MCP (scope: {scope})");
+                    // Same stale-entry cleanup reason as the Claude
+                    // branch above. Codex's MCP entry lives in upstream
+                    // `codex mcp` config (always user-scope), so
+                    // `remove_codex_mcp` shells out to `codex mcp
+                    // remove`; idempotent when nothing's registered.
+                    remove_codex_mcp(agent_name)?;
+                    eprintln!(
+                        "Configured Codex CLI hooks (scope: {scope}); \
+                         MCP skipped + any prior MCP entry for `{agent_name}` removed \
+                         (see warning above)"
+                    );
                 }
             }
             "gemini" => {
                 configure_gemini_hooks(agent_name, &binary_path, scope, &cwd)?;
-                configure_gemini_mcp(
-                    agent_name,
-                    &cwd,
-                    &project_key,
-                    swarm_id,
-                    scope,
-                    &binary_path,
-                )?;
-                eprintln!("Configured Gemini CLI hooks + MCP (scope: {scope})");
+                if local_mcp_compatible {
+                    configure_gemini_mcp(
+                        agent_name,
+                        &cwd,
+                        &project_key,
+                        swarm_id,
+                        scope,
+                        &binary_path,
+                        daemon_host,
+                        daemon_port,
+                    )?;
+                    eprintln!("Configured Gemini CLI hooks + MCP (scope: {scope})");
+                } else {
+                    // Same stale-entry cleanup as Claude / Codex:
+                    // strip any pre-existing `gosh-memory-{agent}`
+                    // entry from Gemini's `settings.json` (both scopes,
+                    // best-effort) so an operator re-binding the daemon
+                    // to a non-loopback interface doesn't leave a dead
+                    // MCP registration behind.
+                    remove_gemini_mcp(agent_name, &cwd)?;
+                    eprintln!(
+                        "Configured Gemini CLI hooks (scope: {scope}); \
+                         MCP skipped + any prior MCP entry for `{agent_name}` removed \
+                         (see warning above)"
+                    );
+                }
             }
             _ => {}
         }
+    }
+
+    // Autostart artifact: install (or refresh) the launchd plist /
+    // systemd user unit unless the operator opted out. `install` is
+    // idempotent — re-running setup just rewrites the unit and reloads
+    // it, which also kicks the daemon into picking up any GlobalConfig
+    // changes this run wrote. Failures here are non-fatal: the rest of
+    // setup (config + hooks/MCP) is already on disk, the user can run
+    // `gosh agent start` manually if autostart didn't take.
+    if !no_autostart {
+        if let Err(e) = super::autostart::install(agent_name) {
+            eprintln!("autostart install failed (continuing): {e}");
+        }
+    } else {
+        eprintln!("Autostart skipped (--no-autostart). Supervise `gosh-agent serve --name {agent_name}` yourself.");
     }
 
     eprintln!("\nSetup complete. Authority: {}", global_config.authority_url);
@@ -148,6 +315,13 @@ pub async fn run(
     Ok(())
 }
 
+/// Patch fields on `GlobalConfig`. Each `Option`-typed argument either
+/// updates the field (when present) or preserves the existing value
+/// (when `None`). Two exceptions where re-running setup is **assumed
+/// to overwrite**: `key` (always rewritten — setup always picks one)
+/// and `swarm_id` (always rewritten — `None` clears, so a setup run
+/// without `--swarm` reverts the agent to agent-private scope).
+#[allow(clippy::too_many_arguments)]
 fn write_global_config(
     agent_name: &str,
     authority_url: Option<&str>,
@@ -155,6 +329,16 @@ fn write_global_config(
     principal_auth_token: Option<&str>,
     key: &str,
     swarm_id: Option<&str>,
+    host: Option<&str>,
+    port: Option<u16>,
+    watch: Option<bool>,
+    watch_key: Option<&str>,
+    watch_swarm_id: Option<&str>,
+    watch_agent_id: Option<&str>,
+    watch_context_key: Option<&str>,
+    watch_budget: Option<f64>,
+    poll_interval: Option<u64>,
+    oauth_dcr_enabled: bool,
 ) -> Result<GlobalConfig> {
     let mut config = GlobalConfig::load(agent_name).unwrap_or_else(|_| GlobalConfig {
         authority_url: "http://127.0.0.1:8765".to_string(),
@@ -163,6 +347,16 @@ fn write_global_config(
         install_id: uuid::Uuid::new_v4().to_string(),
         key: None,
         swarm_id: None,
+        host: None,
+        port: None,
+        watch: false,
+        watch_key: None,
+        watch_swarm_id: None,
+        watch_agent_id: None,
+        watch_context_key: None,
+        watch_budget: None,
+        poll_interval: None,
+        oauth_dcr_enabled: true,
     });
 
     if let Some(url) = authority_url {
@@ -177,6 +371,39 @@ fn write_global_config(
     config.key = Some(key.to_string());
     // Always update swarm_id — None clears it (reverts to agent-private scope)
     config.swarm_id = swarm_id.map(|s| s.to_string());
+
+    // Patch semantics for the rest: only override when an explicit value
+    // arrived; otherwise keep what's already on disk.
+    if let Some(h) = host {
+        config.host = Some(h.to_string());
+    }
+    if let Some(p) = port {
+        config.port = Some(p);
+    }
+    if let Some(w) = watch {
+        config.watch = w;
+    }
+    if let Some(wk) = watch_key {
+        config.watch_key = Some(wk.to_string());
+    }
+    if let Some(ws) = watch_swarm_id {
+        config.watch_swarm_id = Some(ws.to_string());
+    }
+    if let Some(wa) = watch_agent_id {
+        config.watch_agent_id = Some(wa.to_string());
+    }
+    if let Some(wc) = watch_context_key {
+        config.watch_context_key = Some(wc.to_string());
+    }
+    if let Some(wb) = watch_budget {
+        config.watch_budget = Some(wb);
+    }
+    if let Some(pi) = poll_interval {
+        config.poll_interval = Some(pi);
+    }
+    // Always overwrite — setup declares the desired DCR state on
+    // every run, same as `--no-autostart`.
+    config.oauth_dcr_enabled = oauth_dcr_enabled;
 
     config.save(agent_name)?;
     Ok(config)
@@ -336,15 +563,41 @@ fn remove_hooks_for_agent(path: &Path, agent_name: &str) -> Result<bool> {
 }
 
 /// Build args for `gosh-agent mcp-proxy` invocation by an LLM CLI.
-/// `swarm` is appended as `--default-swarm <id>` only when set, so default
-/// (no-swarm) installs stay clean.
-fn build_mcp_proxy_args(agent_name: &str, key: &str, swarm: Option<&str>) -> Vec<String> {
+/// Emits explicit `--daemon-host` / `--daemon-port` derived from the
+/// per-instance `GlobalConfig` (with bind→client host normalisation
+/// via `client_host_for_local`). Without these, the proxy would fall
+/// back to `127.0.0.1:8767` defaults — fine for a single agent on the
+/// default port, but on a host running two agents (or one agent on a
+/// non-default port) the proxy would dial the *wrong* daemon, which
+/// `/mcp` then accepts as direct-loopback and executes under the
+/// wrong agent's namespace (bypassing the OAuth Bearer gate). Found
+/// in the post-v0.8.0 review.
+///
+/// `swarm` is appended as `--default-swarm <id>` only when set, so
+/// the default (no-swarm) installs stay clean.
+///
+/// `daemon_host` / `daemon_port` are passed in by the caller (which
+/// just wrote them into `GlobalConfig` a few lines earlier in setup);
+/// taking them as explicit params keeps this function trivially
+/// unit-testable without poking at the on-disk config layout.
+fn build_mcp_proxy_args(
+    agent_name: &str,
+    key: &str,
+    swarm: Option<&str>,
+    daemon_host: &str,
+    daemon_port: u16,
+) -> Vec<String> {
+    let host = super::net::client_host_for_local(daemon_host);
     let mut args = vec![
         "mcp-proxy".to_string(),
         "--name".to_string(),
         agent_name.to_string(),
         "--default-key".to_string(),
         key.to_string(),
+        "--daemon-host".to_string(),
+        host,
+        "--daemon-port".to_string(),
+        daemon_port.to_string(),
     ];
     if let Some(s) = swarm {
         args.push("--default-swarm".to_string());
@@ -353,6 +606,7 @@ fn build_mcp_proxy_args(agent_name: &str, key: &str, swarm: Option<&str>) -> Vec
     args
 }
 
+#[allow(clippy::too_many_arguments)]
 fn configure_claude_mcp(
     agent_name: &str,
     cwd: &Path,
@@ -360,12 +614,24 @@ fn configure_claude_mcp(
     swarm: Option<&str>,
     mcp_scope: &str,
     binary: &str,
+    daemon_host: &str,
+    daemon_port: u16,
 ) -> Result<()> {
     match mcp_scope {
-        "user" => configure_claude_mcp_user(agent_name, cwd, key, swarm, binary),
+        "user" => {
+            configure_claude_mcp_user(agent_name, cwd, key, swarm, binary, daemon_host, daemon_port)
+        }
         // "project" is the default; any unexpected value is treated as project
         // (clap already restricts valid values, so this is just defensive).
-        _ => configure_claude_mcp_project(agent_name, cwd, key, swarm, binary),
+        _ => configure_claude_mcp_project(
+            agent_name,
+            cwd,
+            key,
+            swarm,
+            binary,
+            daemon_host,
+            daemon_port,
+        ),
     }
 }
 
@@ -406,6 +672,8 @@ fn configure_claude_mcp_project(
     key: &str,
     swarm: Option<&str>,
     binary: &str,
+    daemon_host: &str,
+    daemon_port: u16,
 ) -> Result<()> {
     // Migration: a previous `agent setup --scope user` may have called
     // `claude mcp add -s user gosh-memory-{agent}`, leaving a global
@@ -429,7 +697,7 @@ fn configure_claude_mcp_project(
         format!("gosh-memory-{agent_name}"),
         serde_json::json!({
             "command": binary,
-            "args": build_mcp_proxy_args(agent_name, key, swarm),
+            "args": build_mcp_proxy_args(agent_name, key, swarm, daemon_host, daemon_port),
         }),
     );
 
@@ -442,6 +710,8 @@ fn configure_claude_mcp_user(
     key: &str,
     swarm: Option<&str>,
     binary: &str,
+    daemon_host: &str,
+    daemon_port: u16,
 ) -> Result<()> {
     // Idempotent: remove any prior user-scope registration before adding,
     // so re-running setup never errors on "server already exists".
@@ -460,7 +730,7 @@ fn configure_claude_mcp_user(
         );
     }
 
-    let proxy_args = build_mcp_proxy_args(agent_name, key, swarm);
+    let proxy_args = build_mcp_proxy_args(agent_name, key, swarm, daemon_host, daemon_port);
     let mut cmd_args: Vec<String> = vec![
         "mcp".to_string(),
         "add".to_string(),
@@ -506,7 +776,7 @@ fn remove_claude_project_entry(agent_name: &str, cwd: &Path) -> Result<bool> {
     Ok(removed)
 }
 
-fn remove_platform(agent_name: &str, platform: &str, cwd: &Path) {
+pub(super) fn remove_platform(agent_name: &str, platform: &str, cwd: &Path) {
     let removed = match platform {
         "claude" => {
             remove_claude_hooks(agent_name, cwd).is_ok()
@@ -628,6 +898,8 @@ fn configure_codex_mcp(
     key: &str,
     swarm: Option<&str>,
     binary: &str,
+    daemon_host: &str,
+    daemon_port: u16,
 ) -> Result<()> {
     // Codex CLI requires `codex mcp add` — config.toml [mcp-servers] is not read.
     let output = std::process::Command::new("codex")
@@ -639,7 +911,7 @@ fn configure_codex_mcp(
         }
     }
 
-    let proxy_args = build_mcp_proxy_args(agent_name, key, swarm);
+    let proxy_args = build_mcp_proxy_args(agent_name, key, swarm, daemon_host, daemon_port);
     let mut cmd_args: Vec<String> = vec![
         "mcp".to_string(),
         "add".to_string(),
@@ -749,6 +1021,7 @@ fn configure_gemini_hooks(agent_name: &str, binary: &str, scope: &str, cwd: &Pat
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn configure_gemini_mcp(
     agent_name: &str,
     cwd: &Path,
@@ -756,6 +1029,8 @@ fn configure_gemini_mcp(
     swarm: Option<&str>,
     scope: &str,
     binary: &str,
+    daemon_host: &str,
+    daemon_port: u16,
 ) -> Result<()> {
     let settings_path = gemini_settings_path(scope, cwd);
     if let Some(parent) = settings_path.parent() {
@@ -773,7 +1048,7 @@ fn configure_gemini_mcp(
         format!("gosh-memory-{agent_name}"),
         serde_json::json!({
             "command": binary,
-            "args": build_mcp_proxy_args(agent_name, key, swarm),
+            "args": build_mcp_proxy_args(agent_name, key, swarm, daemon_host, daemon_port),
         }),
     );
 
@@ -946,8 +1221,51 @@ mod tests {
         assert!(!item_matches_agent(&item, "a"));
     }
 
+    use super::build_mcp_proxy_args;
     use super::remove_claude_project_entry;
     use super::writes_project_files_in_cwd;
+
+    #[test]
+    fn build_mcp_proxy_args_emits_explicit_daemon_endpoint() {
+        // Regression for the post-v0.8.0 review: without explicit
+        // --daemon-host / --daemon-port, the proxy fell back to
+        // 127.0.0.1:8767 and could route /mcp traffic to the wrong
+        // daemon (cross-instance bypass when two agents run on the
+        // same host with different ports).
+        let args = build_mcp_proxy_args("alpha", "alpha-key", None, "127.0.0.1", 9000);
+        assert!(args.contains(&"--daemon-host".to_string()));
+        assert!(args.contains(&"--daemon-port".to_string()));
+        assert!(args.contains(&"127.0.0.1".to_string()));
+        assert!(args.contains(&"9000".to_string()));
+    }
+
+    #[test]
+    fn build_mcp_proxy_args_normalises_unspecified_bind_to_loopback() {
+        // The daemon may be bound to 0.0.0.0 (TLS-frontend deployments)
+        // or :: (IPv6 deployments), but the local proxy must dial
+        // loopback. The caller passes whatever's in GlobalConfig and
+        // the helper rewrites it.
+        let args_v4 = build_mcp_proxy_args("alpha", "k", None, "0.0.0.0", 8767);
+        let host_idx_v4 = args_v4.iter().position(|a| a == "--daemon-host").unwrap();
+        assert_eq!(args_v4[host_idx_v4 + 1], "127.0.0.1");
+
+        let args_v6 = build_mcp_proxy_args("alpha", "k", None, "::", 8767);
+        let host_idx_v6 = args_v6.iter().position(|a| a == "--daemon-host").unwrap();
+        assert_eq!(args_v6[host_idx_v6 + 1], "[::1]");
+    }
+
+    #[test]
+    fn build_mcp_proxy_args_includes_swarm_when_set() {
+        let args = build_mcp_proxy_args("alpha", "k", Some("team-gosh"), "127.0.0.1", 8767);
+        let swarm_idx = args.iter().position(|a| a == "--default-swarm").unwrap();
+        assert_eq!(args[swarm_idx + 1], "team-gosh");
+    }
+
+    #[test]
+    fn build_mcp_proxy_args_omits_swarm_when_none() {
+        let args = build_mcp_proxy_args("alpha", "k", None, "127.0.0.1", 8767);
+        assert!(!args.contains(&"--default-swarm".to_string()));
+    }
 
     #[test]
     fn cwd_root_guard_skips_user_scope() {
@@ -988,6 +1306,55 @@ mod tests {
         // An unknown platform name (clap should reject these earlier, but
         // the helper is defensive) doesn't on its own trigger the guard.
         assert!(!writes_project_files_in_cwd("project", &["unknown".to_string()]));
+    }
+
+    #[test]
+    fn remove_claude_mcp_strips_stale_entry_for_incompatible_bind_path() {
+        // Regression for the post-v0.8.0+1 review: when an operator
+        // re-runs `gosh-agent setup` on an instance whose previous
+        // bind was loopback-compatible (so `.mcp.json` got a working
+        // `gosh-memory-{name}` entry) but whose new bind is concrete
+        // non-loopback, the per-CLI branch in `run` calls
+        // `remove_claude_mcp` to strip the now-stale entry rather
+        // than leave it dialling a dead loopback target. Pin that
+        // helper does the strip when called this way.
+        let dir = tempfile::tempdir().unwrap();
+        let mcp_path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &mcp_path,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "gosh-memory-alpha": {
+                        "command": "/usr/local/bin/gosh-agent",
+                        "args": ["mcp-proxy", "--name", "alpha", "--default-key", "k",
+                                 "--daemon-host", "127.0.0.1", "--daemon-port", "8767"],
+                    },
+                    "unrelated-tool": { "command": "z", "args": [] },
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // This is exactly what the incompatible-bind branch in
+        // `run` invokes for the Claude case (sans the user-scope
+        // best-effort half — only project scope is testable in
+        // isolation since user-scope shells out to `claude mcp
+        // remove`).
+        super::remove_claude_mcp("alpha", dir.path()).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        let servers = after.get("mcpServers").unwrap().as_object().unwrap();
+        assert!(
+            !servers.contains_key("gosh-memory-alpha"),
+            "stale gosh-memory-alpha must be removed so the dead loopback target \
+             stops being dialled, got: {after:?}",
+        );
+        assert!(
+            servers.contains_key("unrelated-tool"),
+            "unrelated entries from other tools must be preserved, got: {after:?}",
+        );
     }
 
     #[test]

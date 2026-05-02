@@ -1,7 +1,9 @@
 // Copyright 2026 (c) Mitja Goroshevsky and GOSH Technology Ltd.
 // SPDX-License-Identifier: MIT
 
+mod access_log;
 mod handlers;
+mod mcp_events;
 mod state;
 
 use std::sync::Arc;
@@ -43,12 +45,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Bearer; remote callers must present `Authorization: Bearer
     // <access_token>`. Mounted on a sub-router so the middleware
     // applies only to `/mcp` and not to `/health` / `/oauth/*`.
-    let mcp = Router::new().route("/mcp", post(handlers::mcp::handle)).layer(
-        middleware::from_fn_with_state(
+    let mcp = Router::new()
+        .route("/mcp", post(handlers::mcp::handle).get(handlers::mcp::sse::handle))
+        .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             handlers::mcp_auth::require_bearer_or_loopback,
-        ),
-    );
+        ));
 
     Router::new()
         .route("/health", get(handlers::health::handle))
@@ -60,6 +62,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/oauth/revoke", post(handlers::oauth::revoke::handle))
         .merge(mcp)
         .merge(admin)
+        .layer(middleware::from_fn(access_log::log_request))
         .with_state(state)
 }
 

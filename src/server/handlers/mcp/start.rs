@@ -4,9 +4,20 @@
 use serde_json::json;
 use serde_json::Value;
 
+use crate::agent::run::AgentRunRequest;
+use crate::agent::task::TaskProgressEvent;
+use crate::agent::task::TaskProgressReporter;
 use crate::server::AppState;
 
 pub async fn handle(state: &AppState, args: &Value) -> Value {
+    handle_with_session(state, args, None).await
+}
+
+pub async fn handle_with_session(
+    state: &AppState,
+    args: &Value,
+    mcp_session_id: Option<&str>,
+) -> Value {
     let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(&state.agent_id);
     let swarm_id = args.get("swarm_id").and_then(|v| v.as_str()).unwrap_or("default");
     let work_key = args.get("key").and_then(|v| v.as_str()).unwrap_or("default");
@@ -72,41 +83,74 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
                 .unwrap_or(json!({"error": "serialization failed"}));
         }
     };
+    if let Some(session_id) = mcp_session_id {
+        state.mcp_events.bind_task_session(&resolved.task_fact_id, session_id).await;
+    }
 
-    {
+    let already_running = {
         let mut in_flight = state.in_flight_tasks.lock().await;
         if in_flight.contains(&resolved.task_fact_id) {
-            return json!({
-                "task_id": task_ref,
-                "task_fact_id": resolved.task_fact_id,
-                "status": "already_running",
-                "shell_spent": 0.0,
-                "artifacts_written": [],
-            });
+            true
+        } else {
+            in_flight.insert(resolved.task_fact_id.clone());
+            false
         }
-        in_flight.insert(resolved.task_fact_id.clone());
+    };
+    if already_running {
+        emit_session_terminal(state, &resolved, "already_running", "task is already running").await;
+        return json!({
+            "task_id": task_ref,
+            "task_fact_id": resolved.task_fact_id,
+            "status": "already_running",
+            "shell_spent": 0.0,
+            "artifacts_written": [],
+        });
     }
-    {
+
+    let busy = {
         let mut counts = state.in_flight_by_agent.lock().await;
         let current = counts.get(agent_id).copied().unwrap_or(0);
         if current >= state.agent.config.max_parallel_tasks {
-            let mut in_flight = state.in_flight_tasks.lock().await;
-            in_flight.remove(&resolved.task_fact_id);
-            return json!({
-                "task_id": task_ref,
-                "task_fact_id": resolved.task_fact_id,
-                "status": "busy",
-                "shell_spent": 0.0,
-                "artifacts_written": [],
-                "error": "AGENT_CONCURRENCY_LIMIT",
-            });
+            true
+        } else {
+            counts.insert(agent_id.to_string(), current + 1);
+            false
         }
-        counts.insert(agent_id.to_string(), current + 1);
+    };
+    if busy {
+        let mut in_flight = state.in_flight_tasks.lock().await;
+        in_flight.remove(&resolved.task_fact_id);
+        drop(in_flight);
+        emit_session_terminal(state, &resolved, "busy", "agent concurrency limit reached").await;
+        return json!({
+            "task_id": task_ref,
+            "task_fact_id": resolved.task_fact_id,
+            "status": "busy",
+            "shell_spent": 0.0,
+            "artifacts_written": [],
+            "error": "AGENT_CONCURRENCY_LIMIT",
+        });
     }
+
+    let (reporter, mut progress_rx) = TaskProgressReporter::channel();
+    let mcp_events = state.mcp_events.clone();
+    tokio::spawn(async move {
+        while let Some(event) = progress_rx.recv().await {
+            mcp_events.emit_task_progress(event).await;
+        }
+    });
 
     let run_result = state
         .agent
-        .run(agent_id, swarm_id, &resolved.task_fact_id, work_key, context_key, budget)
+        .run_with_progress(AgentRunRequest {
+            agent_id,
+            swarm_id,
+            task_id: &resolved.task_fact_id,
+            work_key,
+            default_context_key: context_key,
+            budget_shell: budget,
+            progress: Some(reporter),
+        })
         .await;
 
     {
@@ -127,16 +171,55 @@ pub async fn handle(state: &AppState, args: &Value) -> Value {
         Ok(task_result) => {
             serde_json::to_value(&task_result).unwrap_or(json!({"error": "serialization failed"}))
         }
-        Err(e) => {
-            json!({
-                "task_id": task_ref,
-                "status": "failed",
-                "shell_spent": 0.0,
-                "artifacts_written": [],
-                "error": e.to_string(),
-            })
-        }
+        Err(e) => finish_run_error_after_binding(state, &resolved, &task_ref, e).await,
     }
+}
+
+async fn finish_run_error_after_binding(
+    state: &AppState,
+    resolved: &crate::agent::resolve::ResolvedTask,
+    task_ref: &str,
+    error: anyhow::Error,
+) -> Value {
+    let error = error.to_string();
+    emit_session_terminal(
+        state,
+        resolved,
+        "failed",
+        &format!("task failed before terminal result: {error}"),
+    )
+    .await;
+    json!({
+        "task_id": task_ref,
+        "task_fact_id": resolved.task_fact_id,
+        "status": "failed",
+        "shell_spent": 0.0,
+        "artifacts_written": [],
+        "error": error,
+    })
+}
+
+async fn emit_session_terminal(
+    state: &AppState,
+    resolved: &crate::agent::resolve::ResolvedTask,
+    stage: &str,
+    message: &str,
+) {
+    state
+        .mcp_events
+        .emit_task_progress(
+            TaskProgressEvent::new(
+                resolved.external_task_id.as_deref().unwrap_or(&resolved.task_fact_id),
+                Some(&resolved.task_fact_id),
+                resolved.external_task_id.as_deref(),
+                stage,
+                9,
+                9,
+                message,
+            )
+            .terminal(),
+        )
+        .await;
 }
 
 #[cfg(test)]
@@ -144,10 +227,13 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use anyhow::anyhow;
     use serde_json::json;
 
+    use super::finish_run_error_after_binding;
     use super::handle;
     use crate::agent::config::AgentConfig;
+    use crate::agent::resolve::ResolvedTask;
     use crate::test_support::test_app_state;
     use crate::test_support::test_app_state_with_config_and_delays;
     use crate::test_support::wrap_mcp_response;
@@ -347,5 +433,39 @@ mod tests {
         assert_eq!(metadata.get("status").and_then(|v| v.as_str()), Some("failed"));
         assert_eq!(metadata.get("phase").and_then(|v| v.as_str()), Some("bootstrap_resolve"));
         assert_eq!(metadata.get("complete").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn run_error_after_binding_emits_terminal_progress_and_unbinds_session() {
+        let (state, _) = test_app_state(vec![]);
+        let mut rx = state.mcp_events.subscribe("session_1").await;
+        let resolved = ResolvedTask {
+            task_fact_id: "fact-run-error".to_string(),
+            external_task_id: Some("external-run-error".to_string()),
+            fact: "trigger post-bind error".to_string(),
+            raw: json!({"id": "fact-run-error", "kind": "task"}),
+        };
+        state.mcp_events.bind_task_session(&resolved.task_fact_id, "session_1").await;
+
+        let result = finish_run_error_after_binding(
+            &state,
+            &resolved,
+            "external-run-error",
+            anyhow!("boom"),
+        )
+        .await;
+
+        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(result.get("task_fact_id").and_then(|v| v.as_str()), Some("fact-run-error"));
+        let event = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("terminal progress timeout")
+            .expect("terminal progress event");
+        assert_eq!(event.data["method"], "notifications/progress");
+        assert_eq!(event.data["params"]["progressToken"], "fact-run-error");
+        assert_eq!(event.data["params"]["_meta"]["stage"], "failed");
+        assert_eq!(event.data["params"]["_meta"]["terminal"], true);
+        assert!(event.data["params"]["message"].as_str().unwrap_or("").contains("boom"));
+        assert!(state.mcp_events.bound_sessions_for_task("fact-run-error").await.is_empty());
     }
 }

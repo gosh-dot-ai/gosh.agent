@@ -30,6 +30,7 @@ use clap::Parser;
 use clap::Subcommand;
 use tokio::sync::Mutex;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 use crate::agent::config::AgentConfig;
 use crate::agent::pricing::PricingCatalog;
@@ -168,8 +169,12 @@ enum Command {
         #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         key: Option<String>,
         /// Swarm ID for captured data (enables swarm-shared scope).
-        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        /// Without this flag, setup preserves the existing swarm setting.
+        #[arg(long, conflicts_with = "no_swarm", value_parser = clap::builder::NonEmptyStringValueParser::new())]
         swarm: Option<String>,
+        /// Clear any previously configured swarm and capture as agent-private.
+        #[arg(long)]
+        no_swarm: bool,
         /// Limit to specific platforms (repeatable: claude, codex, gemini).
         /// If omitted, all detected CLIs are configured.
         #[arg(long)]
@@ -249,6 +254,11 @@ enum Command {
         #[arg(long)]
         poll_interval: Option<u64>,
 
+        /// Daemon log level persisted into per-instance config. `RUST_LOG`
+        /// still wins when set for one-off diagnostics.
+        #[arg(long)]
+        log_level: Option<plugin::config::LogLevel>,
+
         /// Disable Dynamic Client Registration on the daemon's
         /// `/oauth/register` endpoint. By default the daemon accepts
         /// unauthenticated DCR per RFC 7591 (the standard MCP-spec
@@ -288,10 +298,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { .. } => {
-            tracing_subscriber::fmt::init();
-            serve(cli.command).await
-        }
+        Command::Serve { .. } => serve(cli.command).await,
         Command::Capture { name, platform, event } => {
             init_plugin_tracing();
             plugin::capture::run(&name, &platform, &event).await
@@ -314,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
             auth_token,
             key,
             swarm,
+            no_swarm,
             platform,
             scope,
             host,
@@ -326,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
             watch_context_key,
             watch_budget,
             poll_interval,
+            log_level,
             no_oauth_dcr,
             no_autostart,
         } => {
@@ -352,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
                 principal_auth_token: auth_token.as_deref(),
                 key: key.as_deref(),
                 swarm_id: swarm.as_deref(),
+                no_swarm,
                 platforms: &platform,
                 scope: &scope,
                 host: host.as_deref(),
@@ -363,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
                 watch_context_key: watch_context_key.as_deref(),
                 watch_budget,
                 poll_interval,
+                log_level,
                 oauth_dcr_enabled: oauth_dcr_arg,
                 no_autostart,
             })
@@ -395,6 +406,18 @@ fn init_plugin_tracing() {
         )
         .with_writer(std::io::stderr)
         .init();
+}
+
+fn init_daemon_tracing(log_level: plugin::config::LogLevel) {
+    let filter = match std::env::var_os("RUST_LOG") {
+        Some(_) => EnvFilter::from_default_env(),
+        None => EnvFilter::new(format!(
+            "gosh_agent={level},gosh_agent::http={level},hyper=warn,h2=warn,tower=warn,tower_http=warn,reqwest=warn",
+            level = log_level.as_str(),
+        )),
+    };
+
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -446,6 +469,8 @@ async fn serve(cmd: Command) -> anyhow::Result<()> {
              to provision it"
         )
     })?;
+    init_daemon_tracing(global_config.log_level);
+
     let forwarding_default_key = global_config.key.clone().filter(|s| !s.is_empty());
     let forwarding_default_swarm_id = global_config.swarm_id.clone().filter(|s| !s.is_empty());
 
@@ -586,6 +611,7 @@ async fn serve(cmd: Command) -> anyhow::Result<()> {
         dispatched_tasks: Mutex::new(server::DispatchedTracker::default()),
         in_flight_tasks: Mutex::new(HashSet::new()),
         in_flight_by_agent: Mutex::new(HashMap::new()),
+        mcp_events: Default::default(),
         oauth_dcr_enabled: global_config.oauth_dcr_enabled,
         oauth_clients: Mutex::new(oauth_clients_store),
         oauth_sessions: Mutex::new(oauth_sessions_store),
@@ -642,6 +668,7 @@ async fn serve(cmd: Command) -> anyhow::Result<()> {
     println!("  Secrets:     per-task (resolved from memory at execution time)");
     println!("  Watch mode:  {}", if watch { "ON" } else { "off" });
     println!("  POST /mcp    → agent_start, agent_status");
+    println!("  GET  /mcp    → MCP SSE progress stream");
     println!("  GET  /health → health check");
 
     // Surface non-loopback binds prominently — operator should know

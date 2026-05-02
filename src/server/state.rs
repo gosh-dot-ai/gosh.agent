@@ -14,6 +14,7 @@ use crate::courier::CourierListener;
 use crate::oauth::clients::ClientStore;
 use crate::oauth::sessions::SessionStore;
 use crate::oauth::tokens::TokenStore;
+use crate::server::mcp_events::McpEventHub;
 
 pub(crate) const DISPATCH_TRACKER_CAPACITY: usize = 10_000;
 
@@ -75,6 +76,7 @@ pub struct AppState {
     pub dispatched_tasks: Mutex<DispatchedTracker>,
     pub in_flight_tasks: Mutex<HashSet<String>>,
     pub in_flight_by_agent: Mutex<HashMap<String, usize>>,
+    pub mcp_events: McpEventHub,
 
     /// Whether the OAuth `/oauth/register` endpoint accepts unauth'd
     /// Dynamic Client Registration requests. Mirrors

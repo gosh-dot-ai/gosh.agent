@@ -9,6 +9,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::config::GlobalConfig;
+use super::config::LogLevel;
 
 const VALID_PLATFORMS: &[&str] = &["claude", "codex", "gemini"];
 
@@ -26,6 +27,9 @@ pub struct SetupArgs<'a> {
     pub principal_auth_token: Option<&'a str>,
     pub key: Option<&'a str>,
     pub swarm_id: Option<&'a str>,
+    /// Clear any existing `GlobalConfig.swarm_id`. Without this and without
+    /// `swarm_id`, setup preserves the existing swarm setting.
+    pub no_swarm: bool,
     pub platforms: &'a [String],
     pub scope: &'a str,
     /// Daemon HTTP bind. `None` keeps existing or falls back to `127.0.0.1`.
@@ -40,6 +44,8 @@ pub struct SetupArgs<'a> {
     pub watch_context_key: Option<&'a str>,
     pub watch_budget: Option<f64>,
     pub poll_interval: Option<u64>,
+    /// Operator-facing daemon log level. `None` preserves the existing value.
+    pub log_level: Option<LogLevel>,
     /// Desired state of the daemon's OAuth `/oauth/register` endpoint
     /// (RFC 7591 Dynamic Client Registration). Setup declares this
     /// state on every run — same shape as `no_autostart`. Always
@@ -62,6 +68,7 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
         principal_auth_token,
         key,
         swarm_id,
+        no_swarm,
         platforms,
         scope,
         host,
@@ -73,6 +80,7 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
         watch_context_key,
         watch_budget,
         poll_interval,
+        log_level,
         oauth_dcr_enabled,
         no_autostart,
     } = args;
@@ -106,7 +114,9 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
         );
     }
 
-    let project_key = resolve_or_prompt_key(key, &cwd)?;
+    let existing_config = GlobalConfig::load(agent_name).ok();
+    let project_key = resolve_setup_key(key, existing_config.as_ref(), &cwd)?;
+    let effective_swarm_id = resolve_setup_swarm(swarm_id, no_swarm, existing_config.as_ref());
 
     let global_config = write_global_config(
         agent_name,
@@ -114,7 +124,7 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
         token,
         principal_auth_token,
         &project_key,
-        swarm_id,
+        effective_swarm_id.as_deref(),
         host,
         port,
         watch,
@@ -124,6 +134,7 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
         watch_context_key,
         watch_budget,
         poll_interval,
+        log_level,
         oauth_dcr_enabled,
     )?;
     eprintln!("Config written to {}", GlobalConfig::path(agent_name).display());
@@ -198,7 +209,7 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
                         agent_name,
                         &cwd,
                         &project_key,
-                        swarm_id,
+                        effective_swarm_id.as_deref(),
                         scope,
                         &binary_path,
                         daemon_host,
@@ -229,7 +240,7 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
                         agent_name,
                         &cwd,
                         &project_key,
-                        swarm_id,
+                        effective_swarm_id.as_deref(),
                         &binary_path,
                         daemon_host,
                         daemon_port,
@@ -263,7 +274,7 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
                         agent_name,
                         &cwd,
                         &project_key,
-                        swarm_id,
+                        effective_swarm_id.as_deref(),
                         scope,
                         &binary_path,
                         daemon_host,
@@ -305,7 +316,7 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
     }
 
     eprintln!("\nSetup complete. Authority: {}", global_config.authority_url);
-    match swarm_id {
+    match effective_swarm_id.as_deref() {
         Some(s) => eprintln!("Capture scope: swarm-shared (swarm: {s})"),
         None => eprintln!(
             "Capture scope: agent-private — capture stays local to this agent.\n\
@@ -317,10 +328,9 @@ pub async fn run(args: SetupArgs<'_>) -> Result<()> {
 
 /// Patch fields on `GlobalConfig`. Each `Option`-typed argument either
 /// updates the field (when present) or preserves the existing value
-/// (when `None`). Two exceptions where re-running setup is **assumed
-/// to overwrite**: `key` (always rewritten — setup always picks one)
-/// and `swarm_id` (always rewritten — `None` clears, so a setup run
-/// without `--swarm` reverts the agent to agent-private scope).
+/// (when `None`). `key` and `swarm_id` are resolved to their effective values
+/// before this function: explicit flags win, otherwise existing config values
+/// are preserved, and `--no-swarm` resolves to `None`.
 #[allow(clippy::too_many_arguments)]
 fn write_global_config(
     agent_name: &str,
@@ -338,6 +348,7 @@ fn write_global_config(
     watch_context_key: Option<&str>,
     watch_budget: Option<f64>,
     poll_interval: Option<u64>,
+    log_level: Option<LogLevel>,
     oauth_dcr_enabled: bool,
 ) -> Result<GlobalConfig> {
     let mut config = GlobalConfig::load(agent_name).unwrap_or_else(|_| GlobalConfig {
@@ -357,6 +368,7 @@ fn write_global_config(
         watch_budget: None,
         poll_interval: None,
         oauth_dcr_enabled: true,
+        log_level: LogLevel::Info,
     });
 
     if let Some(url) = authority_url {
@@ -401,6 +413,9 @@ fn write_global_config(
     if let Some(pi) = poll_interval {
         config.poll_interval = Some(pi);
     }
+    if let Some(level) = log_level {
+        config.log_level = level;
+    }
     // Always overwrite — setup declares the desired DCR state on
     // every run, same as `--no-autostart`.
     config.oauth_dcr_enabled = oauth_dcr_enabled;
@@ -409,12 +424,32 @@ fn write_global_config(
     Ok(config)
 }
 
-fn resolve_or_prompt_key(explicit_key: Option<&str>, cwd: &Path) -> Result<String> {
+fn resolve_setup_key(
+    explicit_key: Option<&str>,
+    existing_config: Option<&GlobalConfig>,
+    cwd: &Path,
+) -> Result<String> {
     if let Some(k) = explicit_key {
         return Ok(k.to_string());
     }
+    if let Some(existing_key) = existing_config.and_then(|c| c.key.as_deref()) {
+        return Ok(existing_key.to_string());
+    }
 
     super::config::resolve_key(cwd)
+}
+
+fn resolve_setup_swarm(
+    explicit_swarm: Option<&str>,
+    no_swarm: bool,
+    existing_config: Option<&GlobalConfig>,
+) -> Option<String> {
+    if no_swarm {
+        return None;
+    }
+    explicit_swarm
+        .map(ToOwned::to_owned)
+        .or_else(|| existing_config.and_then(|c| c.swarm_id.clone()))
 }
 
 fn find_self_binary() -> String {
@@ -1223,7 +1258,76 @@ mod tests {
 
     use super::build_mcp_proxy_args;
     use super::remove_claude_project_entry;
+    use super::resolve_setup_key;
+    use super::resolve_setup_swarm;
     use super::writes_project_files_in_cwd;
+    use crate::plugin::config::GlobalConfig;
+    use crate::plugin::config::LogLevel;
+
+    fn global_config_with_scope(key: Option<&str>, swarm_id: Option<&str>) -> GlobalConfig {
+        GlobalConfig {
+            authority_url: "http://127.0.0.1:8765".to_string(),
+            token: None,
+            principal_auth_token: None,
+            install_id: "install".to_string(),
+            key: key.map(ToOwned::to_owned),
+            swarm_id: swarm_id.map(ToOwned::to_owned),
+            host: None,
+            port: None,
+            watch: false,
+            watch_key: None,
+            watch_swarm_id: None,
+            watch_agent_id: None,
+            watch_context_key: None,
+            watch_budget: None,
+            poll_interval: None,
+            oauth_dcr_enabled: true,
+            log_level: LogLevel::Info,
+        }
+    }
+
+    #[test]
+    fn resolve_setup_key_preserves_existing_when_flag_omitted() {
+        let existing = global_config_with_scope(Some("saved-key"), Some("saved-swarm"));
+        let resolved = resolve_setup_key(None, Some(&existing), std::path::Path::new("/no/git"))
+            .expect("existing key should be enough");
+
+        assert_eq!(resolved, "saved-key");
+    }
+
+    #[test]
+    fn resolve_setup_key_prefers_explicit_flag() {
+        let existing = global_config_with_scope(Some("saved-key"), None);
+        let resolved = resolve_setup_key(
+            Some("explicit-key"),
+            Some(&existing),
+            std::path::Path::new("/no/git"),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, "explicit-key");
+    }
+
+    #[test]
+    fn resolve_setup_swarm_preserves_existing_when_flag_omitted() {
+        let existing = global_config_with_scope(Some("saved-key"), Some("saved-swarm"));
+
+        assert_eq!(
+            resolve_setup_swarm(None, false, Some(&existing)).as_deref(),
+            Some("saved-swarm")
+        );
+    }
+
+    #[test]
+    fn resolve_setup_swarm_prefers_explicit_and_no_swarm_clears() {
+        let existing = global_config_with_scope(Some("saved-key"), Some("saved-swarm"));
+
+        assert_eq!(
+            resolve_setup_swarm(Some("explicit-swarm"), false, Some(&existing)).as_deref(),
+            Some("explicit-swarm")
+        );
+        assert_eq!(resolve_setup_swarm(Some("explicit-swarm"), true, Some(&existing)), None);
+    }
 
     #[test]
     fn build_mcp_proxy_args_emits_explicit_daemon_endpoint() {

@@ -397,11 +397,15 @@ mod oauth_router {
     use axum::extract::connect_info::MockConnectInfo;
     use axum::http::Request;
     use axum::http::StatusCode;
+    use serde_json::json;
     use serde_json::Value;
+    use tokio_stream::StreamExt;
     use tower::ServiceExt;
 
     use crate::server::build_router;
+    use crate::test_support::test_app_state;
     use crate::test_support::test_app_state_with_oauth;
+    use crate::test_support::wrap_mcp_response;
 
     /// Drive a single request against the router; return status + body bytes.
     /// `peer` simulates the connecting socket so the admin middleware can
@@ -1124,6 +1128,55 @@ mod oauth_router {
         (status, headers, body)
     }
 
+    async fn drive_full_headers(
+        router: axum::Router,
+        peer: SocketAddr,
+        req: Request<Body>,
+    ) -> (StatusCode, HeaderMap) {
+        let svc = router.layer(MockConnectInfo(peer));
+        let resp = svc.oneshot(req).await.expect("router responded");
+        (resp.status(), resp.headers().clone())
+    }
+
+    async fn drive_response(
+        router: axum::Router,
+        peer: SocketAddr,
+        req: Request<Body>,
+    ) -> axum::response::Response {
+        let svc = router.layer(MockConnectInfo(peer));
+        svc.oneshot(req).await.expect("router responded")
+    }
+
+    fn first_sse_data(buffer: &str) -> Option<Value> {
+        for event in buffer.split("\n\n") {
+            let data = event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !data.is_empty() {
+                return Some(serde_json::from_str(&data).expect("SSE data is JSON"));
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn access_log_middleware_adds_request_id_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let router = build_full(true, "T", tmp.path());
+        let req = Request::builder().method("GET").uri("/health").body(Body::empty()).unwrap();
+
+        let (status, headers, _) = drive_full(router, loopback(), req).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id header should be present");
+        uuid::Uuid::parse_str(request_id).expect("x-request-id should be a UUID");
+    }
+
     /// DCR-register + return both `client_id` and `client_secret` so
     /// tests can authenticate at `/oauth/token`.
     async fn dcr_register_with_secret(router: axum::Router) -> (String, String) {
@@ -1473,6 +1526,99 @@ mod oauth_router {
         assert_eq!(v["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
         // Belt-and-suspenders: must not be the historical hardcode.
         assert_ne!(v["result"]["serverInfo"]["version"], "0.1.0");
+    }
+
+    #[tokio::test]
+    async fn mcp_get_opens_sse_stream_for_loopback_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let router = build_full(true, "T", tmp.path());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("Mcp-Session-Id", "session_123")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers) = drive_full_headers(router, loopback(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("mcp-session-id").unwrap(), "session_123");
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "GET /mcp must open an SSE stream, got {content_type}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sse_stream_delivers_queued_progress_for_created_task() {
+        let responses = vec![
+            wrap_mcp_response(&json!({"status": "ok"})),
+            wrap_mcp_response(&json!({"facts": [{"id": "fact_1"}]})),
+        ];
+        let (state, _) = test_app_state(responses);
+        let router = build_router(state);
+
+        let sse_req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("Mcp-Session-Id", "session_queued")
+            .body(Body::empty())
+            .unwrap();
+        let sse_resp = drive_response(router.clone(), loopback(), sse_req).await;
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let mut sse_stream = sse_resp.into_body().into_data_stream();
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("Mcp-Session-Id", "session_queued")
+            .body(Body::from(
+                serde_json::to_string(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_create_task",
+                        "arguments": {
+                            "description": "stream queued progress",
+                            "scope": "swarm-shared",
+                            "task_id": "task_1",
+                            "target": ["agent:default"],
+                            "key": "work",
+                            "swarm_id": "swarm_1"
+                        }
+                    }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let (status, _, body) = drive_full(router, loopback(), create_req).await;
+        assert_eq!(status, StatusCode::OK);
+        let create_response = parse_body(&body);
+        assert_eq!(create_response["result"]["isError"], false);
+
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), sse_stream.next())
+            .await
+            .expect("SSE event timeout")
+            .expect("SSE stream item")
+            .expect("SSE chunk");
+        let event = first_sse_data(&String::from_utf8_lossy(&chunk)).expect("SSE data event");
+        assert_eq!(event["method"], "notifications/progress");
+        assert_eq!(event["params"]["progressToken"], "fact_1");
+        assert_eq!(event["params"]["progress"], 0);
+        assert_eq!(event["params"]["_meta"]["stage"], "queued");
+        assert_eq!(event["params"]["_meta"]["terminal"], false);
+    }
+
+    #[tokio::test]
+    async fn mcp_get_remote_caller_without_bearer_returns_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let router = build_full(true, "T", tmp.path());
+        let req = Request::builder().method("GET").uri("/mcp").body(Body::empty()).unwrap();
+        let (status, headers) = drive_full_headers(router, remote(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let www = headers.get("www-authenticate").unwrap().to_str().unwrap();
+        assert!(www.contains("Bearer"), "GET /mcp 401 must advertise Bearer realm: {www}");
     }
 
     #[tokio::test]

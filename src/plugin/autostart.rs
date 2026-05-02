@@ -76,6 +76,12 @@ fn launchd_plist_path(agent_name: &str) -> PathBuf {
     home.join("Library").join("LaunchAgents").join(format!("{}.plist", launchd_label(agent_name)))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn daemon_log_path(agent_name: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    home.join(".gosh").join("run").join(format!("agent_{agent_name}.log"))
+}
+
 #[cfg(target_os = "macos")]
 fn launchd_install(agent_name: &str, binary: &Path) -> Result<()> {
     let plist_path = launchd_plist_path(agent_name);
@@ -86,16 +92,13 @@ fn launchd_install(agent_name: &str, binary: &Path) -> Result<()> {
 
     let state = state_dir(agent_name);
     std::fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
-    let stdout_path = state.join("daemon.out.log");
-    let stderr_path = state.join("daemon.err.log");
+    let log_path = daemon_log_path(agent_name);
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
 
-    let plist = render_launchd_plist(
-        &launchd_label(agent_name),
-        binary,
-        agent_name,
-        &stdout_path,
-        &stderr_path,
-    );
+    let plist = render_launchd_plist(&launchd_label(agent_name), binary, agent_name, &log_path);
     std::fs::write(&plist_path, plist)
         .with_context(|| format!("writing {}", plist_path.display()))?;
 
@@ -157,13 +160,7 @@ fn plist_to_str(path: &Path) -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn render_launchd_plist(
-    label: &str,
-    binary: &Path,
-    agent_name: &str,
-    stdout_path: &Path,
-    stderr_path: &Path,
-) -> String {
+fn render_launchd_plist(label: &str, binary: &Path, agent_name: &str, log_path: &Path) -> String {
     // Minimal escaping: `<` and `&` are the only characters that matter
     // in plist string content, and label/agent_name are constrained
     // upstream. Paths come from std::env::current_exe / dirs::home_dir.
@@ -187,9 +184,9 @@ fn render_launchd_plist(
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{stdout}</string>
+    <string>{log}</string>
     <key>StandardErrorPath</key>
-    <string>{stderr}</string>
+    <string>{log}</string>
     <key>ProcessType</key>
     <string>Background</string>
 </dict>
@@ -198,8 +195,7 @@ fn render_launchd_plist(
         label = xml_escape(label),
         binary = xml_escape(&binary.to_string_lossy()),
         name = xml_escape(agent_name),
-        stdout = xml_escape(&stdout_path.to_string_lossy()),
-        stderr = xml_escape(&stderr_path.to_string_lossy()),
+        log = xml_escape(&log_path.to_string_lossy()),
     )
 }
 
@@ -226,8 +222,13 @@ fn systemd_install(agent_name: &str, binary: &Path) -> Result<()> {
 
     let state = state_dir(agent_name);
     std::fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
+    let log_path = daemon_log_path(agent_name);
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
 
-    let unit = render_systemd_unit(binary, agent_name);
+    let unit = render_systemd_unit(binary, agent_name, &log_path);
     std::fs::write(&unit_path, unit).with_context(|| format!("writing {}", unit_path.display()))?;
 
     let unit_name = systemd_unit_name(agent_name);
@@ -298,7 +299,7 @@ fn systemd_uninstall(agent_name: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn render_systemd_unit(binary: &Path, agent_name: &str) -> String {
+fn render_systemd_unit(binary: &Path, agent_name: &str, log_path: &Path) -> String {
     format!(
         "[Unit]\n\
          Description=GOSH Agent (instance: {agent_name})\n\
@@ -307,12 +308,15 @@ fn render_systemd_unit(binary: &Path, agent_name: &str) -> String {
          [Service]\n\
          Type=simple\n\
          ExecStart={binary} serve --name {agent_name}\n\
+         StandardOutput=append:{log}\n\
+         StandardError=append:{log}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
         binary = binary.display(),
+        log = log_path.display(),
     )
 }
 
@@ -336,15 +340,15 @@ mod tests {
             "com.gosh.agent.alpha",
             std::path::Path::new("/usr/local/bin/gosh-agent"),
             "alpha",
-            std::path::Path::new("/tmp/out.log"),
-            std::path::Path::new("/tmp/err.log"),
+            std::path::Path::new("/tmp/agent_alpha.log"),
         );
         assert!(xml.contains("<string>com.gosh.agent.alpha</string>"));
         assert!(xml.contains("<string>/usr/local/bin/gosh-agent</string>"));
         assert!(xml.contains("<string>serve</string>"));
         assert!(xml.contains("<string>--name</string>"));
         assert!(xml.contains("<string>alpha</string>"));
-        assert!(xml.contains("<string>/tmp/out.log</string>"));
+        assert!(xml.contains("<string>/tmp/agent_alpha.log</string>"));
+        assert_eq!(xml.matches("<string>/tmp/agent_alpha.log</string>").count(), 2);
     }
 
     #[cfg(target_os = "linux")]
@@ -359,9 +363,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn render_systemd_unit_contains_serve_name() {
-        let unit =
-            super::render_systemd_unit(std::path::Path::new("/usr/local/bin/gosh-agent"), "alpha");
+        let unit = super::render_systemd_unit(
+            std::path::Path::new("/usr/local/bin/gosh-agent"),
+            "alpha",
+            std::path::Path::new("/tmp/agent_alpha.log"),
+        );
         assert!(unit.contains("ExecStart=/usr/local/bin/gosh-agent serve --name alpha"));
+        assert!(unit.contains("StandardOutput=append:/tmp/agent_alpha.log"));
+        assert!(unit.contains("StandardError=append:/tmp/agent_alpha.log"));
         assert!(unit.contains("Description=GOSH Agent (instance: alpha)"));
     }
 }

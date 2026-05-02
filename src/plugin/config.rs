@@ -83,6 +83,9 @@ pub struct GlobalConfig {
     /// `gosh agent oauth clients register --name <X> --redirect-uri <URI>`.
     #[serde(default = "default_true")]
     pub oauth_dcr_enabled: bool,
+    /// Operator-facing daemon log level. `RUST_LOG` still wins when set.
+    #[serde(default = "default_log_level")]
+    pub log_level: LogLevel,
 }
 
 /// Serde default helper for bool fields whose absence means `true`.
@@ -90,6 +93,55 @@ pub struct GlobalConfig {
 /// wrong fallback for opt-in-by-default fields like `oauth_dcr_enabled`.
 fn default_true() -> bool {
     true
+}
+
+fn default_log_level() -> LogLevel {
+    LogLevel::Info
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.to_ascii_lowercase().as_str() {
+            "error" => Ok(Self::Error),
+            "warn" | "warning" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            other => Err(format!(
+                "unknown log level '{other}'; expected one of error, warn, info, debug, trace"
+            )),
+        }
+    }
 }
 
 /// Per-project config: .gosh-memory.toml
@@ -268,6 +320,7 @@ mod tests {
             watch_budget: None,
             poll_interval: None,
             oauth_dcr_enabled: false,
+            log_level: LogLevel::Info,
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let loaded: GlobalConfig = toml::from_str(&text).unwrap();
@@ -296,5 +349,22 @@ mod tests {
             "missing oauth_dcr_enabled in legacy TOML must default to true \
              (DCR on) — this is the helper-function regression guard"
         );
+    }
+
+    #[test]
+    fn legacy_global_config_without_log_level_defaults_to_info() {
+        let legacy = r#"
+            authority_url = "http://127.0.0.1:8765"
+            install_id = "x"
+        "#;
+        let parsed: GlobalConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn log_level_parses_case_insensitively() {
+        assert_eq!("debug".parse::<LogLevel>().unwrap(), LogLevel::Debug);
+        assert_eq!("WARN".parse::<LogLevel>().unwrap(), LogLevel::Warn);
+        assert!("verbose".parse::<LogLevel>().is_err());
     }
 }

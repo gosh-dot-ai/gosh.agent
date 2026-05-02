@@ -18,6 +18,13 @@ Use `gosh-agent serve` for the long-running agent process. Configure it through
 the CLI-generated bootstrap/config files rather than embedding tokens in shell
 history or scripts.
 
+`gosh-agent setup --log-level <error|warn|info|debug|trace>` persists the
+normal daemon verbosity in the per-instance config. `RUST_LOG` still overrides
+that value for targeted diagnostics. HTTP access logs are emitted through the
+`gosh_agent::http` tracing target and omit headers, bodies, and query strings.
+Re-running setup with only `--log-level` preserves the saved memory `key` and
+`swarm_id`; use `--no-swarm` when you explicitly want agent-private capture.
+
 ## Release Contents
 
 The public package intentionally includes this `docs/` directory, the root MIT

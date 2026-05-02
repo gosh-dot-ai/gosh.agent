@@ -4,6 +4,7 @@
 pub mod courier_subscribe;
 pub mod courier_unsubscribe;
 pub mod create_task;
+pub mod sse;
 pub mod start;
 pub mod status;
 pub mod task_list;
@@ -19,6 +20,7 @@ use serde_json::json;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::agent::task::TaskProgressEvent;
 use crate::client::memory::MemoryMcpClient;
 use crate::client::memory_inject;
 use crate::server::AppState;
@@ -79,9 +81,12 @@ pub async fn handle(
         "tools/call" => {
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            let request_session_id = request_session_id(&headers);
 
             let result = match tool_name {
-                "agent_start" => start::handle(&state, &args).await,
+                "agent_start" => {
+                    start::handle_with_session(&state, &args, request_session_id.as_deref()).await
+                }
                 "agent_status" => status::handle(&state, &args).await,
                 "agent_create_task" => create_task::handle(&state, &args).await,
                 "agent_task_list" => task_list::handle(&state, &args).await,
@@ -118,6 +123,9 @@ pub async fn handle(
                     "code": "UNKNOWN_TOOL"
                 }),
             };
+            if tool_name == "agent_create_task" {
+                bind_created_task_to_session(&state, request_session_id.as_deref(), &result).await;
+            }
 
             let is_error =
                 result.get("error").is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
@@ -146,6 +154,38 @@ pub async fn handle(
 
         _ => (StatusCode::OK, "").into_response(),
     }
+}
+
+fn request_session_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("Mcp-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && *v != "none")
+        .map(str::to_string)
+}
+
+async fn bind_created_task_to_session(state: &AppState, session_id: Option<&str>, result: &Value) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let Some(task_fact_id) = result.get("task_fact_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    state.mcp_events.bind_task_session(task_fact_id, session_id).await;
+    let task_id = result.get("task_id").and_then(|v| v.as_str()).unwrap_or(task_fact_id);
+    state
+        .mcp_events
+        .emit_task_progress(TaskProgressEvent::new(
+            task_id,
+            Some(task_fact_id),
+            Some(task_id),
+            "queued",
+            0,
+            9,
+            "task queued for agent execution",
+        ))
+        .await;
 }
 
 /// Compose the daemon's exposed `tools/list` surface: filtered
@@ -346,8 +386,11 @@ async fn forward_memory_tool(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::json;
 
+    use super::bind_created_task_to_session;
     use super::build_tools_list;
     use super::externally_exposed_agent_tools;
     use super::filtered_memory_tools;
@@ -355,6 +398,7 @@ mod tests {
     use super::grounded_memory_tool_allowed;
     use crate::client::memory::MemoryMcpClient;
     use crate::test_support::take_calls;
+    use crate::test_support::test_app_state;
     use crate::test_support::wrap_mcp_response;
     use crate::test_support::MockTransport;
 
@@ -632,5 +676,37 @@ mod tests {
         let names: Vec<&str> =
             tools.iter().map(|t| t.get("name").unwrap().as_str().unwrap()).collect();
         assert_eq!(names, vec!["agent_create_task", "agent_status", "agent_task_list"]);
+    }
+
+    #[tokio::test]
+    async fn bind_created_task_to_session_emits_queued_progress() {
+        let (state, _) = test_app_state(vec![]);
+        let mut rx = state.mcp_events.subscribe("session_1").await;
+
+        bind_created_task_to_session(
+            &state,
+            Some("session_1"),
+            &json!({
+                "task_id": "task_1",
+                "task_fact_id": "fact_1",
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            state.mcp_events.bound_sessions_for_task("fact_1").await,
+            vec!["session_1".to_string()]
+        );
+
+        let event = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("queued progress timeout")
+            .expect("queued progress event");
+        assert_eq!(event.event, "message");
+        assert_eq!(event.data["method"], "notifications/progress");
+        assert_eq!(event.data["params"]["progressToken"], "fact_1");
+        assert_eq!(event.data["params"]["progress"], 0);
+        assert_eq!(event.data["params"]["_meta"]["stage"], "queued");
+        assert_eq!(event.data["params"]["_meta"]["terminal"], false);
     }
 }

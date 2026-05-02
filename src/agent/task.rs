@@ -4,6 +4,7 @@
 use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::mpsc;
 
 /// Task status throughout its lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -175,4 +176,63 @@ pub struct TaskResult {
     pub deliverable_kind: Option<DeliverableKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deliverable_fact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskProgressEvent {
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_fact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_task_id: Option<String>,
+    pub stage: String,
+    pub message: String,
+    pub progress: u64,
+    pub total: u64,
+    #[serde(default)]
+    pub terminal: bool,
+}
+
+impl TaskProgressEvent {
+    pub fn new(
+        task_id: impl Into<String>,
+        task_fact_id: Option<&str>,
+        external_task_id: Option<&str>,
+        stage: impl Into<String>,
+        progress: u64,
+        total: u64,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            task_id: task_id.into(),
+            task_fact_id: task_fact_id.map(str::to_string),
+            external_task_id: external_task_id.map(str::to_string),
+            stage: stage.into(),
+            message: message.into(),
+            progress,
+            total,
+            terminal: false,
+        }
+    }
+
+    pub fn terminal(mut self) -> Self {
+        self.terminal = true;
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct TaskProgressReporter {
+    tx: mpsc::UnboundedSender<TaskProgressEvent>,
+}
+
+impl TaskProgressReporter {
+    pub fn channel() -> (Self, mpsc::UnboundedReceiver<TaskProgressEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { tx }, rx)
+    }
+
+    pub fn emit(&self, event: TaskProgressEvent) {
+        let _ = self.tx.send(event);
+    }
 }

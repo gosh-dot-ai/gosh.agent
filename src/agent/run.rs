@@ -32,6 +32,8 @@ use super::pricing::PricingCatalog;
 use super::pricing::DEFAULT_PRICING_CONFIG_DISPLAY_PATH;
 use super::resolve;
 use super::task::DeliverableKind;
+use super::task::TaskProgressEvent;
+use super::task::TaskProgressReporter;
 use super::task::TaskResult;
 use super::task::TaskState;
 use super::task::TaskStatus;
@@ -42,6 +44,7 @@ use crate::client::memory::MemoryMcpClient;
 use crate::client::memory::MemoryQueryParams;
 use crate::client::memory::PlanInferenceParams;
 use crate::client::memory::RecallParams;
+use crate::llm::local_cli::resolve_local_cli_config;
 use crate::llm::local_cli::LocalCliConfig;
 use crate::llm::local_cli::LocalCliProvider;
 use crate::llm::LlmProvider;
@@ -75,6 +78,16 @@ pub struct Agent {
     pub memory: Arc<MemoryMcpClient>,
     secret_ctx: Option<SecretContext>,
     pricing: Arc<PricingCatalog>,
+}
+
+pub(crate) struct AgentRunRequest<'a> {
+    pub agent_id: &'a str,
+    pub swarm_id: &'a str,
+    pub task_id: &'a str,
+    pub work_key: &'a str,
+    pub default_context_key: &'a str,
+    pub budget_shell: f64,
+    pub progress: Option<TaskProgressReporter>,
 }
 
 impl Agent {
@@ -141,16 +154,17 @@ impl Agent {
         Ok(Arc::new(crate::llm::multi::MultiProvider::from_resolved_secrets(&keys)))
     }
 
-    /// Run a task end-to-end. Blocking until completion.
-    pub async fn run(
-        &self,
-        agent_id: &str,
-        swarm_id: &str,
-        task_id: &str,
-        work_key: &str,
-        default_context_key: &str,
-        budget_shell: f64,
-    ) -> Result<TaskResult> {
+    /// Run a task end-to-end and emit lifecycle progress for MCP SSE streams.
+    pub async fn run_with_progress(&self, request: AgentRunRequest<'_>) -> Result<TaskResult> {
+        let AgentRunRequest {
+            agent_id,
+            swarm_id,
+            task_id,
+            work_key,
+            default_context_key,
+            budget_shell,
+            progress,
+        } = request;
         let mut state = TaskState::with_keys(
             task_id,
             agent_id,
@@ -161,6 +175,14 @@ impl Agent {
         );
         let mut budget = BudgetController::new(budget_shell, self.config.review_budget_reserve);
 
+        emit_progress(
+            progress.as_ref(),
+            &state,
+            "bootstrap",
+            1,
+            "resolving task from memory",
+            false,
+        );
         info!(task_id, "bootstrap: resolving task from memory");
         state.phase = "bootstrap".to_string();
 
@@ -174,7 +196,9 @@ impl Agent {
             Ok(Err(e)) => {
                 state.status = TaskStatus::Failed;
                 state.error = Some(format!("RESOLVE_FAILED: {e}"));
-                return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+                return Ok(self
+                    .finish_failed_task_result_with_progress(task_id, &mut state, progress.as_ref())
+                    .await);
             }
             Err(_) => {
                 state.status = TaskStatus::Failed;
@@ -189,7 +213,9 @@ impl Agent {
                     timeout_secs = self.config.bootstrap_memory_timeout.as_secs(),
                     "task resolution timed out"
                 );
-                return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+                return Ok(self
+                    .finish_failed_task_result_with_progress(task_id, &mut state, progress.as_ref())
+                    .await);
             }
         };
 
@@ -213,6 +239,7 @@ impl Agent {
                 .find_map(|field| task_metadata_string(&resolved.raw, field));
 
         info!(task_id, task_fact_id = %resolved.task_fact_id, "task resolved");
+        emit_progress(progress.as_ref(), &state, "task_resolved", 2, "task resolved", false);
 
         let task_text = resolved.fact.clone();
         let mut retrieved_context = String::new();
@@ -246,6 +273,14 @@ impl Agent {
                     context_key = %state.context_key,
                     "task recall completed"
                 );
+                emit_progress(
+                    progress.as_ref(),
+                    &state,
+                    "recall_completed",
+                    3,
+                    "memory recall completed",
+                    false,
+                );
                 Some(recall_result)
             }
             Ok(Err(e)) => {
@@ -267,7 +302,9 @@ impl Agent {
                     timeout_secs = self.config.bootstrap_memory_timeout.as_secs(),
                     "task recall timed out"
                 );
-                return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+                return Ok(self
+                    .finish_failed_task_result_with_progress(task_id, &mut state, progress.as_ref())
+                    .await);
             }
         };
 
@@ -279,6 +316,7 @@ impl Agent {
         // the second server round-trip; the explicit recall above is kept
         // because it gives us the bare `context` string for prompt rendering.
         info!(task_id, "task plan_inference started");
+        emit_progress(progress.as_ref(), &state, "planning", 4, "planning inference route", false);
         let plan_response = match tokio::time::timeout(
             self.config.bootstrap_memory_timeout,
             self.memory.plan_inference(PlanInferenceParams {
@@ -311,7 +349,9 @@ impl Agent {
                     timeout_secs = self.config.bootstrap_memory_timeout.as_secs(),
                     "task plan_inference timed out"
                 );
-                return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+                return Ok(self
+                    .finish_failed_task_result_with_progress(task_id, &mut state, progress.as_ref())
+                    .await);
             }
         };
 
@@ -332,7 +372,9 @@ impl Agent {
                      fallback) did not provide a model"
                         .to_string(),
                 );
-                return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+                return Ok(self
+                    .finish_failed_task_result_with_progress(task_id, &mut state, progress.as_ref())
+                    .await);
             }
         };
 
@@ -343,6 +385,14 @@ impl Agent {
             } else {
                 crate::llm::multi::secret_name_for_model(model_id).to_string()
             };
+        emit_progress(
+            progress.as_ref(),
+            &state,
+            "backend_resolved",
+            5,
+            format!("selected execution backend {}", state.backend_current),
+            false,
+        );
 
         let model_pricing =
             match resolve_model_pricing(&self.pricing, model_id, recall_plan.as_ref()) {
@@ -350,7 +400,13 @@ impl Agent {
                 Err(e) => {
                     state.status = TaskStatus::Failed;
                     state.error = Some(format!("PRICING_CONFIG_ERROR: {e}"));
-                    return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+                    return Ok(self
+                        .finish_failed_task_result_with_progress(
+                            task_id,
+                            &mut state,
+                            progress.as_ref(),
+                        )
+                        .await);
                 }
             };
 
@@ -360,6 +416,15 @@ impl Agent {
             if local_cli.workspace_dir.is_none() {
                 local_cli.workspace_dir = state.workspace_dir.clone();
             }
+            info!(
+                task_id,
+                model = model_id,
+                backend = "local_cli",
+                local_cli = local_cli.cli_label(),
+                cli_bin = %local_cli.cli_bin_display(),
+                workspace_dir = ?local_cli.workspace_dir,
+                "execution backend selected"
+            );
             Arc::new(LocalCliProvider::new(local_cli))
         } else {
             // Resolve API key for the model memory chose. local_cli profiles do not use API
@@ -372,15 +437,35 @@ impl Agent {
                         "NO_SECRET_REF: memory recall did not provide secret_ref in payload_meta"
                             .to_string(),
                     );
-                    return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+                    return Ok(self
+                        .finish_failed_task_result_with_progress(
+                            task_id,
+                            &mut state,
+                            progress.as_ref(),
+                        )
+                        .await);
                 }
             };
+            info!(
+                task_id,
+                model = model_id,
+                backend = state.backend_current.as_str(),
+                secret_scope = %secret_ref.scope,
+                secret_name = %secret_ref.name,
+                "execution backend selected"
+            );
             match self.resolve_llm(&state.context_key, model_id, secret_ref).await {
                 Ok(llm) => llm,
                 Err(e) => {
                     state.status = TaskStatus::Failed;
                     state.error = Some(format!("LLM_RESOLVE_FAILED: {e}"));
-                    return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+                    return Ok(self
+                        .finish_failed_task_result_with_progress(
+                            task_id,
+                            &mut state,
+                            progress.as_ref(),
+                        )
+                        .await);
                 }
             }
         };
@@ -388,10 +473,13 @@ impl Agent {
         if task_text.trim().is_empty() {
             state.status = TaskStatus::Failed;
             state.error = Some("NO_TASK_CONTEXT: resolved task has empty fact text".to_string());
-            return Ok(self.finish_failed_task_result(task_id, &mut state).await);
+            return Ok(self
+                .finish_failed_task_result_with_progress(task_id, &mut state, progress.as_ref())
+                .await);
         }
 
         info!(task_id, model = model_id, "starting execution");
+        emit_progress(progress.as_ref(), &state, "execution", 6, "starting task execution", false);
 
         state.phase = "execution".to_string();
         let mut retries = 0u32;
@@ -522,6 +610,14 @@ impl Agent {
             state.result = Some(result_text.clone());
 
             state.phase = "review".to_string();
+            emit_progress(
+                progress.as_ref(),
+                &state,
+                "review",
+                7,
+                "reviewing execution result",
+                false,
+            );
             let reviewed_at = Utc::now().to_rfc3339();
             match self
                 .review(
@@ -612,6 +708,7 @@ impl Agent {
 
         state.shell_spent = budget.spent();
         mark_finished(&mut state);
+        emit_progress(progress.as_ref(), &state, "persistence", 8, "persisting task result", false);
         let completed_as_done = state.status == TaskStatus::Done;
         let (artifacts, persist_error) = match self.persist_results(&mut state).await {
             Ok(mut a) => {
@@ -699,6 +796,15 @@ impl Agent {
             }
         }
 
+        emit_progress(
+            progress.as_ref(),
+            &state,
+            "done",
+            9,
+            format!("task finished with status {}", state.status),
+            true,
+        );
+
         Ok(TaskResult {
             task_id: task_id.to_string(),
             status: state.status.clone(),
@@ -764,6 +870,24 @@ impl Agent {
                 });
             }
         }
+        result
+    }
+
+    async fn finish_failed_task_result_with_progress(
+        &self,
+        task_id: &str,
+        state: &mut TaskState,
+        progress: Option<&TaskProgressReporter>,
+    ) -> TaskResult {
+        let result = self.finish_failed_task_result(task_id, state).await;
+        emit_progress(
+            progress,
+            state,
+            "done",
+            9,
+            format!("task finished with status {}", result.status),
+            true,
+        );
         result
     }
 
@@ -1801,24 +1925,43 @@ fn local_cli_config_from_recall(
             );
         });
     }
-    let Some(cli_bin_raw) = payload.get("cli_bin").and_then(|value| value.as_str()) else {
-        tracing::warn!("backend=local_cli but cli_bin is missing in recall payload");
-        return None;
-    };
-    let cli_bin = cli_bin_raw.trim().to_string();
-    if cli_bin.is_empty() {
-        tracing::warn!("backend=local_cli but cli_bin is empty in recall payload");
-        return None;
-    }
-    let cli_args_prefix = payload
-        .get("cli_args_prefix")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let workspace_dir = local_cli_workspace_from_recall(payload, payload_meta);
-    Some(Some(LocalCliConfig { cli_bin, cli_args_prefix, workspace_dir }))
+    if let Some(cli_bin_raw) = payload.get("cli_bin").and_then(|value| value.as_str()) {
+        let cli_bin = cli_bin_raw.trim().to_string();
+        if cli_bin.is_empty() {
+            tracing::warn!("backend=local_cli but legacy cli_bin is empty in recall payload");
+            return None;
+        }
+        let cli_args_prefix = payload
+            .get("cli_args_prefix")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return Some(Some(LocalCliConfig::legacy_stdin(cli_bin, cli_args_prefix, workspace_dir)));
+    }
+    let requested = payload
+        .get("local_cli")
+        .and_then(|value| value.as_str())
+        .or_else(|| payload.get("provider").and_then(|value| value.as_str()))
+        .or_else(|| payload.get("model").and_then(|value| value.as_str()))
+        .or_else(|| {
+            payload_meta.and_then(|meta| meta.get("local_cli")).and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            payload_meta.and_then(|meta| meta.get("provider")).and_then(|value| value.as_str())
+        });
+    match resolve_local_cli_config(requested, workspace_dir) {
+        Ok(config) => Some(Some(config)),
+        Err(err) => {
+            tracing::warn!(error = %err, "backend=local_cli could not resolve a local CLI");
+            None
+        }
+    }
 }
 
 fn local_cli_workspace_from_recall(
@@ -2721,6 +2864,29 @@ fn mark_finished(state: &mut TaskState) {
     }
 }
 
+fn emit_progress(
+    reporter: Option<&TaskProgressReporter>,
+    state: &TaskState,
+    stage: &str,
+    progress: u64,
+    message: impl Into<String>,
+    terminal: bool,
+) {
+    let Some(reporter) = reporter else {
+        return;
+    };
+    let event = TaskProgressEvent::new(
+        state.task_id.as_str(),
+        state.task_fact_id.as_deref(),
+        state.external_task_id.as_deref(),
+        stage,
+        progress,
+        9,
+        message,
+    );
+    reporter.emit(if terminal { event.terminal() } else { event });
+}
+
 fn payload_max_tokens(payload: &Value) -> Option<u32> {
     payload.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32)
 }
@@ -2768,6 +2934,7 @@ mod tests {
     use super::sanitize_task_result;
     use super::Agent;
     use super::AgentConfig;
+    use super::AgentRunRequest;
     use super::ModelPricing;
     use super::RecallExecutionPlan;
     use super::ReviewRequest;
@@ -2785,6 +2952,7 @@ mod tests {
     use crate::agent::task::TaskStatus;
     use crate::agent::task::ToolTraceEntry;
     use crate::client::memory::MemoryMcpClient;
+    use crate::llm::local_cli::LocalCliCommand;
     use crate::llm::local_cli::LocalCliConfig;
     use crate::llm::LlmProvider;
     use crate::llm::LlmResponse;
@@ -3028,11 +3196,11 @@ mod tests {
         assert!(plan.secret_ref.is_none());
         assert_eq!(
             plan.local_cli,
-            Some(LocalCliConfig {
-                cli_bin: "/usr/bin/codex".to_string(),
-                cli_args_prefix: vec!["exec".to_string(), "-m".to_string(), "gpt-5.4".to_string()],
-                workspace_dir: None,
-            })
+            Some(LocalCliConfig::legacy_stdin(
+                "/usr/bin/codex",
+                vec!["exec".to_string(), "-m".to_string(), "gpt-5.4".to_string()],
+                None,
+            ))
         );
     }
 
@@ -3052,11 +3220,11 @@ mod tests {
         let plan = execution_plan_from_recall(&recall).unwrap();
         assert_eq!(
             plan.local_cli,
-            Some(LocalCliConfig {
-                cli_bin: "/usr/bin/codex".to_string(),
-                cli_args_prefix: Vec::new(),
-                workspace_dir: Some("/repo/worktree".to_string()),
-            })
+            Some(LocalCliConfig::legacy_stdin(
+                "/usr/bin/codex",
+                Vec::new(),
+                Some("/repo/worktree".to_string()),
+            ))
         );
     }
 
@@ -3077,11 +3245,7 @@ mod tests {
         let plan = execution_plan_from_recall(&recall).unwrap();
         assert_eq!(
             plan.local_cli,
-            Some(LocalCliConfig {
-                cli_bin: "/usr/bin/codex".to_string(),
-                cli_args_prefix: Vec::new(),
-                workspace_dir: None,
-            })
+            Some(LocalCliConfig::legacy_stdin("/usr/bin/codex", Vec::new(), None))
         );
     }
 
@@ -3091,11 +3255,11 @@ mod tests {
             model_id: "gpt-5.4".to_string(),
             max_tokens: 512,
             use_tool: false,
-            local_cli: Some(LocalCliConfig {
-                cli_bin: "/usr/bin/codex".to_string(),
-                cli_args_prefix: vec!["exec".to_string()],
-                workspace_dir: None,
-            }),
+            local_cli: Some(LocalCliConfig::legacy_stdin(
+                "/usr/bin/codex",
+                vec!["exec".to_string()],
+                None,
+            )),
             secret_ref: None,
             pricing: None,
         };
@@ -3136,18 +3300,21 @@ mod tests {
     }
 
     #[test]
-    fn execution_plan_rejects_local_cli_without_cli_bin() {
+    fn execution_plan_accepts_minimal_local_cli_payload() {
         let recall = json!({
             "payload": {
                 "backend": "local_cli",
-                "model": "gpt-5.4",
-                "max_tokens": 512,
-                "cli_args_prefix": ["exec"]
+                "model": "local-cli/codex",
+                "max_tokens": 512
             },
             "payload_meta": {"use_tool": false}
         });
 
-        assert!(execution_plan_from_recall(&recall).is_none());
+        let plan = execution_plan_from_recall(&recall).unwrap();
+        assert_eq!(
+            plan.local_cli,
+            Some(LocalCliConfig { command: LocalCliCommand::Codex, workspace_dir: None })
+        );
     }
 
     #[test]
@@ -3241,11 +3408,11 @@ mod tests {
             model_id: "gpt-5.4".to_string(),
             max_tokens: 512,
             use_tool: false,
-            local_cli: Some(LocalCliConfig {
-                cli_bin: "/usr/bin/codex".to_string(),
-                cli_args_prefix: vec!["exec".to_string()],
-                workspace_dir: None,
-            }),
+            local_cli: Some(LocalCliConfig::legacy_stdin(
+                "/usr/bin/codex",
+                vec!["exec".to_string()],
+                None,
+            )),
             secret_ref: None,
             pricing: None,
         };
@@ -3765,7 +3932,18 @@ mod tests {
         };
         let agent = Agent::new(config, memory, None);
 
-        let result = agent.run("agent-a", "swarm-a", "task-1", "work", "ctx", 10.0).await.unwrap();
+        let result = agent
+            .run_with_progress(AgentRunRequest {
+                agent_id: "agent-a",
+                swarm_id: "swarm-a",
+                task_id: "task-1",
+                work_key: "work",
+                default_context_key: "ctx",
+                budget_shell: 10.0,
+                progress: None,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.status, TaskStatus::Failed);
         assert!(result.error.unwrap().contains("BOOTSTRAP_RECALL_TIMEOUT"));
@@ -3827,7 +4005,18 @@ mod tests {
         };
         let agent = Agent::new(config, memory, None);
 
-        let result = agent.run("agent-a", "swarm-a", "task-1", "work", "ctx", 10.0).await.unwrap();
+        let result = agent
+            .run_with_progress(AgentRunRequest {
+                agent_id: "agent-a",
+                swarm_id: "swarm-a",
+                task_id: "task-1",
+                work_key: "work",
+                default_context_key: "ctx",
+                budget_shell: 10.0,
+                progress: None,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.status, TaskStatus::Failed);
         assert!(result.error.unwrap().contains("BOOTSTRAP_RESOLVE_TIMEOUT"));
